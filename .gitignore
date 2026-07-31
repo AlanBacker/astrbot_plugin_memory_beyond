@@ -1,0 +1,13 @@
+# 内部工程文档，不随插件发布
+memory-plugin-spec.md
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.idea/
+.vscode/
+*.egg-info/
+dist/
+build/

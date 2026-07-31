@@ -1,0 +1,2 @@
+# Memory Beyond 无第三方运行时依赖：仅使用 Python 标准库与 AstrBot API。
+# 本文件保留以满足插件市场的仓库结构约定。

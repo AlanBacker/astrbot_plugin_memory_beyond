@@ -1,0 +1,69 @@
+{
+  "enable_memory": {
+    "description": "启用长期记忆",
+    "type": "bool",
+    "hint": "注入记忆索引并向 LLM 提供 memory_read / memory_write / memory_search 工具。关闭后已存记忆保留在磁盘，仅停止注入与读写。",
+    "default": true
+  },
+  "enable_compression": {
+    "description": "启用上下文压缩",
+    "type": "bool",
+    "hint": "上下文占用超过阈值时自动滚动摘要旧轮次。平台聊天历史始终完整保留，压缩只改变发送给模型的视图。",
+    "default": true
+  },
+  "max_context_tokens": {
+    "description": "模型上下文窗口（tokens）",
+    "type": "int",
+    "hint": "强烈建议手动填写当前使用模型的上下文窗口大小（如 128000）。填 0 时按模型名自动探测；探测失败则压缩停用并在日志中提示。",
+    "default": 0
+  },
+  "compress_threshold": {
+    "description": "压缩触发阈值（占窗口比例）",
+    "type": "float",
+    "hint": "上下文估算占用超过 窗口×阈值 时触发滚动摘要。必须小于 0.82（AstrBot 内置压缩器的阈值），否则会被内置压缩器抢先；配置无效时自动钳制。默认 0.70。",
+    "default": 0.7
+  },
+  "compress_buffer": {
+    "description": "压缩目标缓冲区（占窗口比例）",
+    "type": "float",
+    "hint": "压缩完成后目标占用 = 阈值 - 缓冲区，预留空间避免刚压完又逼近阈值。默认 0.165，约留出窗口六分之一的余量。",
+    "default": 0.165
+  },
+  "keep_recent_turns": {
+    "description": "保留原文的最近轮数",
+    "type": "int",
+    "hint": "滚动摘要时最近 N 轮对话保留原文不进摘要（至少 1 轮）。默认 3。",
+    "default": 3
+  },
+  "summary_provider_id": {
+    "description": "摘要模型提供商",
+    "type": "string",
+    "hint": "指定负责生成压缩摘要的提供商；留空则使用当前对话的提供商。指定的提供商全部重试失败后会自动回退到当前对话提供商。",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "summary_retry_count": {
+    "description": "摘要重试次数",
+    "type": "int",
+    "hint": "摘要提供商调用失败时的最大尝试次数，默认 3。全链路失败后进入指数退避（5 分钟起、上限 1 小时），期间使用应急裁剪视图，不丢任何历史。",
+    "default": 3
+  },
+  "summary_timeout": {
+    "description": "摘要调用超时（秒）",
+    "type": "int",
+    "hint": "单次摘要调用的超时时间，默认 120 秒。",
+    "default": 120
+  },
+  "summary_prompt_template": {
+    "description": "自定义摘要提示词模板",
+    "type": "text",
+    "hint": "留空使用内置的结构化摘要模板。可用占位符：{previous_summary} 已有摘要、{transcript} 待压缩对话。模板损坏时自动回退内置模板。",
+    "default": ""
+  },
+  "extract_memories": {
+    "description": "压缩时联动提取记忆",
+    "type": "bool",
+    "hint": "滚动摘要的同一次 LLM 调用里，顺带把即将淡出上下文的长期事实提取为记忆文件（只写入会话作用域）。",
+    "default": true
+  }
+}

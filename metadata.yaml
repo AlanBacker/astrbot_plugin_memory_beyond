@@ -1,0 +1,9 @@
+name: astrbot_plugin_memory_beyond
+desc: 重新设计的长期记忆与上下文压缩系统：文件式长期记忆（一文件一事实 + MEMORY.md 索引注入）与滚动摘要式上下文压缩。真相在磁盘，上下文只带索引，细节按需取回，压缩后从磁盘重新注入。
+help: 装上即用。LLM 会通过 memory_read / memory_write / memory_search 工具自主管理记忆；上下文超过阈值时自动滚动摘要，平台聊天历史始终完整保留。建议在插件配置中手动填写 max_context_tokens（模型上下文窗口），并可指定专门的摘要提供商。管理员指令：/mb_status 查看状态，/mb_reset 重置本会话压缩状态，/mb_probe 测试摘要链路。
+version: v1.0.0
+author: AlanBacker
+repo: "https://github.com/AlanBacker/astrbot_plugin_memory_beyond"
+display_name: Memory Beyond
+short_desc: 文件式长期记忆 + 滚动摘要上下文压缩。
+astrbot_version: ">=4.5.7"

@@ -1,0 +1,780 @@
+"""Memory Beyond —— 为 AstrBot 重新设计的长期记忆与上下文压缩系统。
+
+核心理念：真相在磁盘，上下文只带索引，细节按需取回，压缩后从磁盘重新注入。
+
+分层约定：
+    main.py  —— 平台适配层（本文件）：钩子、LLM 工具、指令、provider 调用
+    core/    —— 纯逻辑：记忆库、索引、token 估算、轮次切分、压缩状态机
+
+兼容性立场：只依赖 @filter.on_llm_request() / @filter.on_llm_response() /
+@filter.llm_tool() 等公开插件接口，不 import AstrBot 内部实现、不 monkey-patch。
+压缩采用抢先策略：在钩子里把 req.contexts 压到低于内置压缩器 0.82 的阈值，
+内置压缩器的 should_compress() 因此永远为 False、自动退化为 no-op，
+同时留在下游当安全网。平台的会话历史永远一个字不动。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import inspect
+import json
+import time
+from collections import OrderedDict
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from astrbot.api import AstrBotConfig, logger
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.provider import LLMResponse, ProviderRequest
+from astrbot.api.star import Context, Star, StarTools
+
+from .core import compress, memstore, prompts, tokens
+from .core.turns import split_leading_system
+
+PLUGIN_NAME = "astrbot_plugin_memory_beyond"
+LOG_PREFIX = "[memory_beyond] "
+
+# 摘要提供商回退链中，当前对话提供商作为兜底时的尝试次数
+# （作为首选时按配置的 summary_retry_count）。
+FALLBACK_ATTEMPTS = 2
+# 函数工具 schema、人设开场白等无法逐项估算的部分，给一个固定余量。
+TOOL_SCHEMA_ALLOWANCE = 800
+# 应急裁剪时留给正文消息的最小预算。
+MIN_TAIL_BUDGET = 1000
+# 会话运行时缓存上限（LRU 淘汰，仅内存快照，磁盘状态不受影响）。
+MAX_RUNTIME_SESSIONS = 256
+
+# 自动探测模型上下文窗口的对照表：子串匹配，先命中先用。
+# 探测只是兜底，README 中明确建议手动配置 max_context_tokens。
+MODEL_WINDOWS: list[tuple[str, int]] = [
+    ("gpt-5", 400_000),
+    ("gpt-4.1", 1_000_000),
+    ("gpt-4o", 128_000),
+    ("gpt-4-turbo", 128_000),
+    ("o4", 200_000),
+    ("o3", 200_000),
+    ("o1", 200_000),
+    ("claude", 200_000),
+    ("gemini-2", 1_000_000),
+    ("gemini", 1_000_000),
+    ("deepseek", 128_000),
+    ("glm", 128_000),
+    ("qwen3", 128_000),
+    ("qwen-max", 128_000),
+    ("qwen-plus", 128_000),
+    ("qwen", 32_000),
+    ("kimi", 128_000),
+    ("moonshot", 128_000),
+    ("grok-4", 256_000),
+    ("grok", 128_000),
+    ("doubao", 128_000),
+]
+
+
+@dataclass
+class RuntimeSession:
+    """一个会话的内存态：压缩状态 + 索引快照缓存。
+
+    索引在会话首次请求时读盘一次、缓存快照复用（prompt caching 按前缀匹配，
+    注入内容逐轮变化会让缓存全量失效）；中途新存的记忆只写磁盘。
+    压缩发生时清空快照、从磁盘重新加载——这是记忆扛过压缩的核心机制。
+    """
+
+    state: compress.SessionState
+    index_blocks: dict[str, str | None] = field(default_factory=dict)
+    last_estimate: int = 0
+    awaiting_calibration: bool = False
+    warned_window: bool = False
+    warned_summarizer: bool = False
+    warned_clip: bool = False
+
+
+class MemoryBeyondPlugin(Star):
+    def __init__(self, context: Context, config: AstrBotConfig | None = None):
+        super().__init__(context)
+        self.config = config if config is not None else {}
+        data_dir = self._resolve_data_dir()
+        self._store = memstore.MemoryStore(data_dir / "memories")
+        self._state_dir = data_dir / "state"
+        self._sessions: OrderedDict[str, RuntimeSession] = OrderedDict()
+        self._warned_threshold = False
+
+        threshold, warning = compress.validate_threshold(
+            self.config.get("compress_threshold", compress.THRESHOLD_FALLBACK)
+        )
+        if warning:
+            logger.error(LOG_PREFIX + warning)
+        logger.info(
+            LOG_PREFIX
+            + f"已加载：压缩阈值 {threshold}，数据目录 {data_dir}"
+        )
+
+    @staticmethod
+    def _resolve_data_dir() -> Path:
+        try:
+            return Path(StarTools.get_data_dir(PLUGIN_NAME))
+        except Exception:  # noqa: BLE001 - 旧版本 StarTools 行为不一，逐级回退
+            from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+
+            return Path(get_astrbot_data_path()) / "plugin_data" / PLUGIN_NAME
+
+    # ================================================================ 配置
+
+    def _bool(self, key: str, default: bool) -> bool:
+        return bool(self.config.get(key, default))
+
+    def _int(self, key: str, default: int) -> int:
+        try:
+            return int(self.config.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    def _str(self, key: str, default: str = "") -> str:
+        value = self.config.get(key, default)
+        return value if isinstance(value, str) else default
+
+    def _threshold(self) -> float:
+        value, warning = compress.validate_threshold(
+            self.config.get("compress_threshold", compress.THRESHOLD_FALLBACK)
+        )
+        if warning and not self._warned_threshold:
+            self._warned_threshold = True
+            logger.error(LOG_PREFIX + warning)
+        return value
+
+    def _target_ratio(self) -> float:
+        """压缩完成后的目标占用 = 阈值 - 缓冲区，预留空间避免压完立刻又逼近上限。
+
+        缓冲区默认 0.165，约留出窗口六分之一的余量。
+        """
+        try:
+            buffer = float(self.config.get("compress_buffer", 0.165))
+        except (TypeError, ValueError):
+            buffer = 0.165
+        buffer = min(max(buffer, 0.0), 0.5)
+        return max(0.15, self._threshold() - buffer)
+
+    # ============================================================ 会话运行时
+
+    async def _runtime(self, umo: str) -> RuntimeSession:
+        rt = self._sessions.get(umo)
+        if rt is not None:
+            self._sessions.move_to_end(umo)
+            return rt
+        rt = RuntimeSession(state=await self._load_state(umo))
+        self._sessions[umo] = rt
+        while len(self._sessions) > MAX_RUNTIME_SESSIONS:
+            self._sessions.popitem(last=False)
+        return rt
+
+    def _state_path(self, umo: str) -> Path:
+        return self._state_dir / f"{memstore.safe_key(umo)}.json"
+
+    async def _load_state(self, umo: str) -> compress.SessionState:
+        path = self._state_path(umo)
+        try:
+            if path.is_file():
+                raw = await asyncio.to_thread(path.read_text, "utf-8")
+                return compress.SessionState.from_dict(json.loads(raw))
+        except (OSError, ValueError) as exc:
+            logger.warning(LOG_PREFIX + f"读取压缩状态失败（{umo}）：{exc}")
+        return compress.SessionState()
+
+    async def _save_state(self, umo: str, state: compress.SessionState) -> None:
+        path = self._state_path(umo)
+
+        def _write() -> None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(
+                json.dumps(state.to_dict(), ensure_ascii=False), encoding="utf-8"
+            )
+            tmp.replace(path)
+
+        try:
+            await asyncio.to_thread(_write)
+        except OSError as exc:
+            logger.warning(LOG_PREFIX + f"持久化压缩状态失败（{umo}）：{exc}")
+
+    # ============================================================ 身份与作用域
+
+    def _user_key(self, event: AstrMessageEvent) -> str:
+        """全局作用域键：平台 ID + 发送者 ID，跟人走。"""
+        sender = ""
+        try:
+            sender = str(event.get_sender_id() or "").strip()
+        except Exception:  # noqa: BLE001
+            pass
+        platform = ""
+        try:
+            platform = str(event.get_platform_id() or "").strip()
+        except Exception:  # noqa: BLE001
+            umo = str(getattr(event, "unified_msg_origin", ""))
+            platform = umo.split(":", 1)[0] if ":" in umo else ""
+        return f"{platform or 'unknown'}:{sender or 'unknown'}"
+
+    def _global_scope(self, event: AstrMessageEvent) -> memstore.ScopeStore:
+        return self._store.global_scope(self._user_key(event))
+
+    def _session_scope(self, event: AstrMessageEvent) -> memstore.ScopeStore:
+        return self._store.session_scope(str(event.unified_msg_origin))
+
+    def _scope_for(
+        self, event: AstrMessageEvent, scope: str
+    ) -> memstore.ScopeStore | None:
+        scope = (scope or "").strip().lower()
+        if scope == "global":
+            return self._global_scope(event)
+        if scope == "session":
+            return self._session_scope(event)
+        return None
+
+    # ================================================================ 钩子
+
+    @filter.on_llm_request()
+    async def inject_and_compress(
+        self, event: AstrMessageEvent, req: ProviderRequest
+    ):
+        """唯一介入点：注入记忆索引、必要时抢先压缩，拼出本轮发送视图。"""
+        try:
+            await self._process_request(event, req)
+        except Exception:  # noqa: BLE001 - 插件缺陷不能拖垮 LLM 请求链路
+            logger.exception(LOG_PREFIX + "on_llm_request 处理失败，本轮跳过注入与压缩")
+
+    async def _process_request(
+        self, event: AstrMessageEvent, req: ProviderRequest
+    ) -> None:
+        umo = str(getattr(event, "unified_msg_origin", "") or "")
+        if not umo:
+            return
+        rt = await self._runtime(umo)
+        state = rt.state
+        contexts = [m for m in (req.contexts or []) if isinstance(m, dict)]
+
+        # ---- 校验压缩状态仍锚定在当前对话与历史前缀上 ----
+        cid = await self._conversation_id(event, req)
+        if not compress.state_matches(state, cid, contexts):
+            if state.summary:
+                logger.info(
+                    LOG_PREFIX
+                    + f"会话 {umo} 的历史与水位线不再匹配（对话切换或被重置），"
+                    "压缩状态作废重建"
+                )
+            state.cid = cid
+            state.reset_compression()
+            await self._save_state(umo, state)
+
+        # ---- 记忆索引块（会话内快照，压缩后才会从磁盘刷新） ----
+        memory_on = self._bool("enable_memory", True)
+        index_msg = None
+        if memory_on:
+            block = await self._index_block(rt, event)
+            if block:
+                index_msg = prompts.build_index_message(block)
+
+        guidance = prompts.MEMORY_GUIDANCE if memory_on else ""
+        estimator = tokens.TokenEstimator(state.ratio)
+
+        n_system = split_leading_system(contexts)
+        overhead = (
+            estimator.messages(contexts[:n_system])
+            + estimator.text(str(req.system_prompt or "") + guidance)
+            + estimator.text(str(req.prompt or ""))
+            + len(getattr(req, "image_urls", None) or []) * tokens.IMAGE_TOKENS
+            + TOOL_SCHEMA_ALLOWANCE
+        )
+        if index_msg:
+            overhead += estimator.text(index_msg["content"]) + tokens.MESSAGE_OVERHEAD
+
+        def current_tail() -> list[dict]:
+            mark = max(state.watermark, n_system) if state.watermark else n_system
+            return contexts[mark:]
+
+        # ---- 抢先压缩 ----
+        window, window_note = await self._resolve_window(event)
+        compress_on = self._bool("enable_compression", True)
+        if compress_on and window <= 0 and not rt.warned_window:
+            rt.warned_window = True
+            logger.warning(LOG_PREFIX + f"会话 {umo} 压缩已停用：{window_note}")
+
+        tail = current_tail()
+        clipped = False
+        if compress_on and window > 0:
+            total = (
+                overhead
+                + estimator.text(state.summary)
+                + estimator.messages(tail)
+            )
+            if total > int(window * self._threshold()):
+                await self._compress(event, rt, umo, contexts, total)
+                tail = current_tail()
+
+            # 兜底：摘要后仍超预算（或摘要模型不可用）时，把本轮发送视图
+            # 裁进目标预算。只影响本轮，水位线与平台历史都不动。
+            budget = (
+                int(window * self._target_ratio())
+                - overhead
+                - estimator.text(state.summary)
+            )
+            tail, clipped = compress.fit_tail_to_budget(
+                tail, estimator, max(budget, MIN_TAIL_BUDGET)
+            )
+            if clipped:
+                message = (
+                    LOG_PREFIX
+                    + f"会话 {umo} 本轮启用应急裁剪视图（摘要不可用或单轮过大），"
+                    "平台历史未受影响"
+                )
+                if rt.warned_clip:
+                    logger.debug(message)
+                else:
+                    rt.warned_clip = True
+                    logger.warning(message)
+
+        # ---- 拼装发送视图：system 消息 + 索引块 + 摘要块 + 原文尾部 ----
+        view = list(contexts[:n_system])
+        if index_msg:
+            view.append(index_msg)
+        if state.summary:
+            view.append(prompts.build_summary_message(state.summary))
+        view.extend(tail)
+        req.contexts = view
+
+        if guidance and guidance not in str(req.system_prompt or ""):
+            req.system_prompt = str(req.system_prompt or "") + guidance
+
+        rt.last_estimate = (
+            overhead
+            + estimator.text(state.summary)
+            + estimator.messages(tail)
+        )
+        rt.awaiting_calibration = True
+
+    async def _conversation_id(
+        self, event: AstrMessageEvent, req: ProviderRequest
+    ) -> str:
+        conversation = getattr(req, "conversation", None)
+        cid = str(getattr(conversation, "cid", "") or "")
+        if cid:
+            return cid
+        try:
+            mgr = self.context.conversation_manager
+            cid = await mgr.get_curr_conversation_id(event.unified_msg_origin)
+            return str(cid or "")
+        except Exception:  # noqa: BLE001
+            return ""
+
+    async def _index_block(
+        self, rt: RuntimeSession, event: AstrMessageEvent
+    ) -> str | None:
+        user_key = self._user_key(event)
+        if user_key in rt.index_blocks:
+            return rt.index_blocks[user_key]
+        global_snap = await self._global_scope(event).load_index()
+        session_snap = await self._session_scope(event).load_index()
+        block = prompts.build_index_block(global_snap.text, session_snap.text)
+        rt.index_blocks[user_key] = block
+        return block
+
+    # ============================================================ 压缩执行
+
+    async def _compress(
+        self,
+        event: AstrMessageEvent,
+        rt: RuntimeSession,
+        umo: str,
+        contexts: list[dict],
+        total_estimate: int,
+    ) -> None:
+        state = rt.state
+        now = time.time()
+        if state.in_cooldown(now):
+            return
+        plan = compress.plan_compression(
+            contexts, state.watermark, self._int("keep_recent_turns", 3)
+        )
+        if plan is None:
+            return
+        transcript = compress.render_transcript(plan.to_summarize)
+        if not transcript.strip():
+            return
+
+        extract = self._bool("extract_memories", True)
+        prompt = prompts.build_summary_prompt(
+            self._str("summary_prompt_template"),
+            state.summary,
+            transcript,
+            extract,
+        )
+        text, attempts_log = await self._call_summarizer(event, prompt)
+        if text:
+            summary, drafts = prompts.parse_summary_response(text)
+        else:
+            summary, drafts = "", []
+        if not summary:
+            state.record_failure(now)
+            await self._save_state(umo, state)
+            if not rt.warned_summarizer:
+                rt.warned_summarizer = True
+                logger.error(
+                    LOG_PREFIX
+                    + f"会话 {umo} 摘要生成失败（{'; '.join(attempts_log) or '无可用提供商'}），"
+                    f"已连续失败 {state.fail_count} 次，进入退避冷却；"
+                    "冷却期内使用应急裁剪视图，历史无损，冷却后自动重试"
+                )
+            return
+
+        old_watermark = state.watermark
+        compress.apply_summary(state, contexts, plan, summary)
+        rt.warned_summarizer = False
+        rt.warned_clip = False
+        await self._save_state(umo, state)
+        logger.info(
+            LOG_PREFIX
+            + f"会话 {umo} 完成滚动摘要：水位线 {old_watermark} → {state.watermark}"
+            f"（共 {len(contexts)} 条），压缩前估算 {total_estimate} tokens，"
+            f"摘要 {len(state.summary)} 字"
+        )
+
+        if extract and drafts:
+            await self._store_extracted(umo, drafts)
+        # 压缩后从磁盘重新注入记忆索引：清空快照，下次请求重新加载。
+        # 索引不是靠"被摘要保留下来"，而是每次从源头重新加载。
+        rt.index_blocks.clear()
+
+    async def _store_extracted(
+        self, umo: str, drafts: list[prompts.MemoryDraft]
+    ) -> None:
+        """压缩-记忆联动：摘要的同一次 LLM 调用里提取的事实落盘为记忆文件。
+
+        自动提取的信息可能源自群聊，按隐私边界只进会话作用域，绝不进全局。
+        """
+        scope = self._store.session_scope(umo)
+        stored = 0
+        for draft in drafts:
+            try:
+                if await scope.read(draft.filename) is not None:
+                    continue
+                report = await scope.write(
+                    draft.filename, prompts.render_memory_file(draft)
+                )
+                if report.ok:
+                    await scope.append_index_line(
+                        prompts.index_line(draft.name, draft.description)
+                    )
+                    stored += 1
+            except OSError as exc:
+                logger.warning(
+                    LOG_PREFIX + f"压缩联动写入记忆 {draft.filename} 失败：{exc}"
+                )
+        if stored:
+            logger.info(LOG_PREFIX + f"会话 {umo} 压缩联动提取了 {stored} 条记忆入库")
+
+    # ============================================================ 摘要调用链
+
+    async def _call_summarizer(
+        self, event: AstrMessageEvent, prompt: str
+    ) -> tuple[str | None, list[str]]:
+        """按回退链调用摘要模型：配置的提供商（重试 N 次）→ 当前对话提供商。
+
+        返回 (成功文本或 None, 尝试记录)。全部失败的兜底不在这里——由调用方
+        记录失败进入退避冷却，本轮走应急裁剪视图。
+        """
+        timeout = max(10, self._int("summary_timeout", 120))
+        retries = max(1, self._int("summary_retry_count", 3))
+        attempts_log: list[str] = []
+
+        chain: list[tuple[str, object, int]] = []
+        configured_id = self._str("summary_provider_id").strip()
+        if configured_id:
+            provider = await self._provider_by_id(configured_id)
+            if provider is None:
+                attempts_log.append(f"配置的提供商 {configured_id} 未找到")
+                logger.warning(
+                    LOG_PREFIX
+                    + f"配置的摘要提供商 {configured_id} 未找到，回退当前对话提供商"
+                )
+            else:
+                chain.append((f"配置提供商 {configured_id}", provider, retries))
+        current = await self._current_provider(event)
+        if current is not None and all(current is not p for _, p, _ in chain):
+            chain.append(
+                ("当前对话提供商", current, retries if not chain else FALLBACK_ATTEMPTS)
+            )
+
+        for label, provider, attempts in chain:
+            for attempt in range(1, attempts + 1):
+                try:
+                    resp = await asyncio.wait_for(
+                        provider.text_chat(prompt=prompt), timeout=timeout
+                    )
+                    text = self._completion_text(resp)
+                    if text and text.strip():
+                        attempts_log.append(f"{label} 第 {attempt} 次成功")
+                        return text, attempts_log
+                    attempts_log.append(f"{label} 第 {attempt} 次返回空")
+                except asyncio.TimeoutError:
+                    attempts_log.append(f"{label} 第 {attempt} 次超时（{timeout}s）")
+                except Exception as exc:  # noqa: BLE001 - provider 实现不可控
+                    attempts_log.append(f"{label} 第 {attempt} 次失败：{exc}")
+                if attempt < attempts:
+                    await asyncio.sleep(min(2 ** (attempt - 1), 4))
+        return None, attempts_log
+
+    @staticmethod
+    async def _maybe_await(value):
+        if inspect.isawaitable(value):
+            return await value
+        return value
+
+    async def _provider_by_id(self, provider_id: str):
+        try:
+            getter = getattr(self.context, "get_provider_by_id", None)
+            if callable(getter):
+                return await self._maybe_await(getter(provider_id=provider_id))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(LOG_PREFIX + f"按 ID 获取提供商 {provider_id} 失败：{exc}")
+        return None
+
+    async def _current_provider(self, event: AstrMessageEvent):
+        try:
+            return await self._maybe_await(
+                self.context.get_using_provider(umo=event.unified_msg_origin)
+            )
+        except TypeError:
+            try:
+                return await self._maybe_await(self.context.get_using_provider())
+            except Exception:  # noqa: BLE001
+                return None
+        except Exception:  # noqa: BLE001
+            return None
+
+    @staticmethod
+    def _completion_text(resp) -> str:
+        if resp is None:
+            return ""
+        if isinstance(resp, str):
+            return resp
+        try:
+            return str(getattr(resp, "completion_text", "") or "")
+        except Exception:  # noqa: BLE001
+            return ""
+
+    # ========================================================== 窗口探测
+
+    async def _resolve_window(self, event: AstrMessageEvent) -> tuple[int, str]:
+        configured = self._int("max_context_tokens", 0)
+        if configured > 0:
+            return configured, "手动配置"
+        provider = await self._current_provider(event)
+        model = self._provider_model_name(provider)
+        if model:
+            lowered = model.lower()
+            for needle, window in MODEL_WINDOWS:
+                if needle in lowered:
+                    return window, f"按模型 {model} 自动探测"
+        return 0, (
+            f"自动探测模型窗口失败（模型名：{model or '未知'}），"
+            "请在插件配置中手动指定 max_context_tokens"
+        )
+
+    @staticmethod
+    def _provider_model_name(provider) -> str:
+        if provider is None:
+            return ""
+        try:
+            get_model = getattr(provider, "get_model", None)
+            if callable(get_model):
+                name = get_model()
+                if name:
+                    return str(name)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            cfg = getattr(provider, "provider_config", None)
+            if isinstance(cfg, dict):
+                model_cfg = cfg.get("model_config")
+                if isinstance(model_cfg, dict) and model_cfg.get("model"):
+                    return str(model_cfg["model"])
+                if cfg.get("model"):
+                    return str(cfg["model"])
+        except Exception:  # noqa: BLE001
+            pass
+        return ""
+
+    # ========================================================== token 校准
+
+    @filter.on_llm_response()
+    async def calibrate_tokens(self, event: AstrMessageEvent, resp: LLMResponse):
+        """provider 返回真实用量时，用真实值校准估算比例（优先用真实值）。"""
+        try:
+            rt = self._sessions.get(str(getattr(event, "unified_msg_origin", "")))
+            if rt is None or not rt.awaiting_calibration or rt.last_estimate <= 0:
+                return
+            rt.awaiting_calibration = False
+            usage = getattr(getattr(resp, "raw_completion", None), "usage", None)
+            if isinstance(usage, dict):
+                actual = usage.get("prompt_tokens")
+            else:
+                actual = getattr(usage, "prompt_tokens", None)
+            actual = int(actual or 0)
+            if actual <= 0:
+                return
+            estimator = tokens.TokenEstimator(rt.state.ratio)
+            estimator.calibrate(rt.last_estimate, actual)
+            rt.state.ratio = estimator.ratio
+        except Exception:  # noqa: BLE001
+            logger.debug(LOG_PREFIX + "token 校准失败", exc_info=True)
+
+    # ============================================================ 记忆工具
+
+    @filter.llm_tool(name="memory_read")
+    async def memory_read(
+        self, event: AstrMessageEvent, scope: str, file: str = "MEMORY.md"
+    ) -> str:
+        """读取长期记忆文件的完整内容。MEMORY.md 是该作用域的记忆索引；重写索引前必须先用本工具读取完整索引。
+
+        Args:
+            scope(string): 作用域，global（跟随当前用户）或 session（跟随本会话）
+            file(string): 记忆文件名，默认 MEMORY.md，如 user-likes-concise.md
+        """
+        if not self._bool("enable_memory", True):
+            return "记忆功能已在插件配置中停用。"
+        store = self._scope_for(event, scope)
+        if store is None:
+            return "scope 参数必须是 global 或 session。"
+        content = await store.read(file)
+        if content is None:
+            existing = store.list_files()
+            listing = "、".join(existing) if existing else "（该作用域还没有记忆文件）"
+            return f"文件 {file} 不存在。该作用域现有文件：{listing}"
+        return content
+
+    @filter.llm_tool(name="memory_write")
+    async def memory_write(
+        self,
+        event: AstrMessageEvent,
+        scope: str,
+        file: str,
+        content: str = "",
+        delete: bool = False,
+    ) -> str:
+        """写入或删除长期记忆文件。写入事实文件后须同步维护该作用域 MEMORY.md 的索引行（一条记忆一行：- [标题](文件名.md) — 一句话钩子）；删除后须移除对应索引行。隐私边界：群聊中获得的信息默认写 session，只有确属当前用户本人且不涉及第三方的事实才可写 global。
+
+        Args:
+            scope(string): 作用域，global（跟随当前用户）或 session（跟随本会话）
+            file(string): 记忆文件名，须以 .md 结尾，如 project-deadline.md
+            content(string): 完整的文件内容（整文件覆盖写入；delete 为 false 时必填）
+            delete(boolean): 设为 true 时删除该文件，此时忽略 content
+        """
+        if not self._bool("enable_memory", True):
+            return "记忆功能已在插件配置中停用。"
+        store = self._scope_for(event, scope)
+        if store is None:
+            return "scope 参数必须是 global 或 session。"
+        if delete:
+            report = await store.delete(file)
+        else:
+            if not content.strip():
+                return "content 为空。写入需提供完整文件内容；如要删除请设 delete=true。"
+            report = await store.write(file, content)
+        return report.message
+
+    @filter.llm_tool(name="memory_search")
+    async def memory_search(
+        self, event: AstrMessageEvent, query: str, scope: str = "all"
+    ) -> str:
+        """在长期记忆里全文搜索。索引被截断、或不确定某条记忆是否存在时，用本工具兜底查找；它不依赖记忆是否登记在索引里。
+
+        Args:
+            query(string): 搜索词，可用空格分隔多个词（须同时命中）
+            scope(string): 搜索范围，global、session 或 all（默认，两个作用域都搜）
+        """
+        if not self._bool("enable_memory", True):
+            return "记忆功能已在插件配置中停用。"
+        query = (query or "").strip()
+        if not query:
+            return "query 不能为空。"
+        scope = (scope or "all").strip().lower()
+        stores: list[tuple[str, memstore.ScopeStore]] = []
+        if scope in ("global", "all"):
+            stores.append(("global", self._global_scope(event)))
+        if scope in ("session", "all"):
+            stores.append(("session", self._session_scope(event)))
+        if not stores:
+            return "scope 参数必须是 global、session 或 all。"
+        lines: list[str] = []
+        for label, store in stores:
+            for hit in await store.search(query):
+                lines.append(f"[{label}] {hit}")
+        if not lines:
+            return f"没有找到匹配「{query}」的记忆。"
+        return "搜索结果（用 memory_read 读取完整内容）：\n" + "\n".join(lines)
+
+    # ============================================================ 管理指令
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("mb_status")
+    async def show_status(self, event: AstrMessageEvent):
+        """查看 Memory Beyond 当前会话的记忆与压缩状态。"""
+        umo = str(event.unified_msg_origin)
+        rt = await self._runtime(umo)
+        state = rt.state
+        window, window_note = await self._resolve_window(event)
+        global_files = self._global_scope(event).list_files()
+        session_files = self._session_scope(event).list_files()
+        configured_id = self._str("summary_provider_id").strip() or "（未配置，用当前对话提供商）"
+
+        now = time.time()
+        cooldown = (
+            f"退避中，剩余 {int(state.fail_until - now)} 秒（已连续失败 {state.fail_count} 次）"
+            if state.in_cooldown(now)
+            else "正常"
+        )
+        lines = [
+            "Memory Beyond 状态",
+            f"记忆：{'启用' if self._bool('enable_memory', True) else '停用'}"
+            f"（全局 {len(global_files)} 个文件 / 会话 {len(session_files)} 个文件）",
+            f"压缩：{'启用' if self._bool('enable_compression', True) else '停用'}",
+            f"上下文窗口：{window if window > 0 else '未知'}（{window_note}）",
+            f"触发阈值：{self._threshold()}，压缩目标：{self._target_ratio()}",
+            f"水位线：{state.watermark}，摘要：{len(state.summary)} 字",
+            f"最近一次请求估算：{rt.last_estimate} tokens（校准比例 {state.ratio:.2f}）",
+            f"摘要提供商：{configured_id}",
+            f"摘要链路：{cooldown}",
+        ]
+        yield event.plain_result("\n".join(lines))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("mb_reset")
+    async def reset_session(self, event: AstrMessageEvent):
+        """清空本会话的压缩状态（摘要与水位线）。平台聊天历史不受影响。"""
+        umo = str(event.unified_msg_origin)
+        rt = await self._runtime(umo)
+        rt.state.reset_compression()
+        rt.state.record_success()
+        rt.index_blocks.clear()
+        await self._save_state(umo, rt.state)
+        yield event.plain_result(
+            "已清空本会话的压缩状态（摘要与水位线）。平台历史完整保留，"
+            "上下文超过阈值时会重新滚动摘要。"
+        )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("mb_probe")
+    async def probe_summarizer(self, event: AstrMessageEvent):
+        """测试摘要模型回退链是否可用（配置提供商 → 当前对话提供商）。"""
+        yield event.plain_result("正在测试摘要链路……")
+        text, attempts_log = await self._call_summarizer(
+            event, "请只回复两个字符：OK"
+        )
+        detail = "\n".join(attempts_log) if attempts_log else "（没有可尝试的提供商）"
+        if text:
+            yield event.plain_result(f"摘要链路可用。\n{detail}")
+        else:
+            yield event.plain_result(
+                f"摘要链路全部失败，压缩时将启用应急裁剪视图并退避重试。\n{detail}"
+            )
+
+    async def terminate(self):
+        """状态在每次变更时已即时落盘，无需额外清理。"""
