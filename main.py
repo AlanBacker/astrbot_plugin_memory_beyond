@@ -43,8 +43,6 @@ TOOL_SCHEMA_ALLOWANCE = 800
 MIN_TAIL_BUDGET = 1000
 # 会话运行时缓存上限（LRU 淘汰，仅内存快照，磁盘状态不受影响）。
 MAX_RUNTIME_SESSIONS = 256
-# 发送者标注前缀：注入到用户消息开头，让 LLM 以不可伪造的数字 ID 锚定记人。
-SENDER_TAG_PREFIX = "[发送者："
 
 # 自动探测模型上下文窗口的对照表：子串匹配，先命中先用。
 # 探测只是兜底，README 中明确建议手动配置 max_context_tokens。
@@ -216,6 +214,33 @@ class MemoryBeyondPlugin(Star):
             pass
         return sender_id, name
 
+    @staticmethod
+    def _sender_raw_fields(
+        event: AstrMessageEvent,
+    ) -> tuple[str | None, str | None, bool]:
+        """从平台原始事件提取 (QQ昵称, 群名片, 是否群聊)。
+
+        OneBot（aiocqhttp）的 sender.nickname 是 QQ 昵称、sender.card 是
+        群名片；AstrBot 的 MessageMember 只保留了"群名片优先"的单一名称，
+        所以这两个字段必须从 raw_message 里取。取不到时返回 (None, None, …)，
+        标注退化为通用的 名称｜ID 形式。
+        """
+        msg_obj = getattr(event, "message_obj", None)
+        is_group = bool(getattr(msg_obj, "group_id", "") or "")
+        raw = getattr(msg_obj, "raw_message", None)
+        raw_sender = None
+        if isinstance(raw, dict):
+            raw_sender = raw.get("sender")
+        if raw_sender is None:
+            raw_sender = getattr(raw, "sender", None)
+        if isinstance(raw_sender, dict) and (
+            "nickname" in raw_sender or "card" in raw_sender
+        ):
+            qq_name = str(raw_sender.get("nickname") or "")
+            group_card = str(raw_sender.get("card") or "")
+            return qq_name, group_card, is_group
+        return None, None, is_group
+
     def _global_scope(self) -> memstore.ScopeStore:
         """机器人自我的全局记忆，所有会话共享一个目录。"""
         return self._store.global_scope()
@@ -375,19 +400,33 @@ class MemoryBeyondPlugin(Star):
     def _annotate_sender(
         self, event: AstrMessageEvent, req: ProviderRequest
     ) -> None:
-        """在用户消息开头注入 [发送者：数字ID｜昵称] 标注。
+        """在用户消息开头注入 [发送者：…] 标注。
 
-        标注随消息进入会话历史，群聊里跨轮次也能分清谁说了什么；
-        LLM 记人时以标注中的数字 ID 为锚（昵称可变、可被冒用）。
+        QQ 群聊 → 群名片｜QQ名｜QQ号，QQ 私聊 → QQ名｜QQ号，
+        其他平台 → 名称｜ID。标注随消息进入会话历史，群聊里跨轮次
+        也能分清谁说了什么；LLM 记人时以数字 ID 为锚（名称可变、可被冒用）。
+        正文里伪造的标注前缀会先被改写为全角括号，半角前缀因此只可能来自插件。
         """
         prompt = str(req.prompt or "")
-        if not prompt or prompt.startswith(SENDER_TAG_PREFIX):
+        if not prompt:
             return
         sender_id, sender_name = self._sender_identity(event)
         if not sender_id:
             return
-        tag = f"{SENDER_TAG_PREFIX}{sender_id}｜{sender_name or '未知昵称'}]"
-        req.prompt = f"{tag}\n{prompt}"
+        qq_name, group_card, is_group = self._sender_raw_fields(event)
+        tag = prompts.build_sender_tag(
+            sender_id,
+            display_name=sender_name,
+            qq_name=qq_name,
+            group_card=group_card,
+            is_group=is_group,
+        )
+        if not tag:
+            return
+        first_line = prompt.split("\n", 1)[0]
+        if first_line == tag:
+            return  # 同一请求被重复处理时不叠加标注
+        req.prompt = f"{tag}\n{prompts.neutralize_sender_forgery(prompt)}"
 
     async def _index_block(
         self, rt: RuntimeSession, event: AstrMessageEvent
