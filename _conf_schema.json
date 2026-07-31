@@ -5,6 +5,12 @@
     "hint": "注入记忆索引并向 LLM 提供 memory_read / memory_write / memory_search 工具。关闭后已存记忆保留在磁盘，仅停止注入与读写。",
     "default": true
   },
+  "annotate_sender": {
+    "description": "在用户消息前标注发送者数字 ID",
+    "type": "bool",
+    "hint": "在每条用户消息开头注入 [发送者：数字ID｜昵称]，让 LLM 以稳定且不可伪造的数字 ID（如 QQ号）锚定记人——昵称会变、可被冒用。关闭后群聊中无法可靠区分和记住不同的人。",
+    "default": true
+  },
   "enable_compression": {
     "description": "启用上下文压缩",
     "type": "bool",

@@ -70,7 +70,13 @@ def test_build_summary_prompt_empty_previous():
 def test_parse_summary_with_tags_and_memories():
     entries = [
         {"type": "project", "name": "My Deadline", "description": "d", "content": "c"},
-        {"type": "user", "name": "not-allowed", "description": "d", "content": "c"},
+        {
+            "type": "user",
+            "name": "user-12345678",
+            "description": "群友",
+            "content": "QQ 12345678 喜欢简洁回复（昵称：小明）",
+        },
+        {"type": "reference", "name": "not-allowed", "description": "d", "content": "c"},
         {"type": "feedback", "name": "", "description": "d", "content": "c"},
     ]
     text = (
@@ -79,9 +85,11 @@ def test_parse_summary_with_tags_and_memories():
     )
     summary, drafts = parse_summary_response(text)
     assert summary == "## 结论\n压缩摘要"
-    assert len(drafts) == 1  # user 类型与空 name 被过滤
+    assert len(drafts) == 2  # reference 类型与空 name 被过滤
     assert drafts[0].name == "my-deadline"  # slug 归一化
     assert drafts[0].filename == "my-deadline.md"
+    assert drafts[1].type == "user"
+    assert drafts[1].filename == "user-12345678.md"  # 数字 ID 锚定
 
 
 def test_parse_summary_without_tags_falls_back():

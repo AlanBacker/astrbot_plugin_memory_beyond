@@ -3,9 +3,9 @@
 一个文件一条事实（Markdown + frontmatter），每个作用域一个 MEMORY.md
 索引，索引一条记忆占一行、只放指针永不放正文。
 
-聊天场景必需的双层作用域：
-    global/<用户键>/   —— 跟人走，存 user 类，该用户出现在任何会话都注入
-    session/<会话键>/  —— 跟群走，存 project / feedback 类，只在本会话注入
+聊天场景的双层作用域：
+    global/            —— 机器人自我的全局记忆（偏好、行为准则），所有会话共享注入
+    session/<会话键>/  —— 当前会话（UMO）的记忆：本群 / 本私聊里的人和事
 
 索引自动注入通道有 200 行 / 25KB 上限，超出从底部截断；截断时在末尾追加
 一行说明还有多少行未加载、可用搜索工具找到——否则模型根本不知道自己有
@@ -267,8 +267,8 @@ class MemoryStore:
             self._scopes[path] = store
         return store
 
-    def global_scope(self, user_key: str) -> ScopeStore:
-        return self._scope(self.base_dir / "global" / safe_key(user_key))
+    def global_scope(self) -> ScopeStore:
+        return self._scope(self.base_dir / "global")
 
     def session_scope(self, session_key: str) -> ScopeStore:
         return self._scope(self.base_dir / "session" / safe_key(session_key))

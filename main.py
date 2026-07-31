@@ -20,7 +20,7 @@ import inspect
 import json
 import time
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 from astrbot.api import AstrBotConfig, logger
@@ -43,6 +43,8 @@ TOOL_SCHEMA_ALLOWANCE = 800
 MIN_TAIL_BUDGET = 1000
 # 会话运行时缓存上限（LRU 淘汰，仅内存快照，磁盘状态不受影响）。
 MAX_RUNTIME_SESSIONS = 256
+# 发送者标注前缀：注入到用户消息开头，让 LLM 以不可伪造的数字 ID 锚定记人。
+SENDER_TAG_PREFIX = "[发送者："
 
 # 自动探测模型上下文窗口的对照表：子串匹配，先命中先用。
 # 探测只是兜底，README 中明确建议手动配置 max_context_tokens。
@@ -81,7 +83,8 @@ class RuntimeSession:
     """
 
     state: compress.SessionState
-    index_blocks: dict[str, str | None] = field(default_factory=dict)
+    index_block: str | None = None
+    index_loaded: bool = False
     last_estimate: int = 0
     awaiting_calibration: bool = False
     warned_window: bool = False
@@ -198,23 +201,24 @@ class MemoryBeyondPlugin(Star):
 
     # ============================================================ 身份与作用域
 
-    def _user_key(self, event: AstrMessageEvent) -> str:
-        """全局作用域键：平台 ID + 发送者 ID，跟人走。"""
-        sender = ""
+    @staticmethod
+    def _sender_identity(event: AstrMessageEvent) -> tuple[str, str]:
+        """当前发送者的 (数字 ID, 昵称)。ID 不可伪造，昵称仅作附注。"""
+        sender_id = ""
         try:
-            sender = str(event.get_sender_id() or "").strip()
+            sender_id = str(event.get_sender_id() or "").strip()
         except Exception:  # noqa: BLE001
             pass
-        platform = ""
+        name = ""
         try:
-            platform = str(event.get_platform_id() or "").strip()
+            name = str(event.get_sender_name() or "").strip()
         except Exception:  # noqa: BLE001
-            umo = str(getattr(event, "unified_msg_origin", ""))
-            platform = umo.split(":", 1)[0] if ":" in umo else ""
-        return f"{platform or 'unknown'}:{sender or 'unknown'}"
+            pass
+        return sender_id, name
 
-    def _global_scope(self, event: AstrMessageEvent) -> memstore.ScopeStore:
-        return self._store.global_scope(self._user_key(event))
+    def _global_scope(self) -> memstore.ScopeStore:
+        """机器人自我的全局记忆，所有会话共享一个目录。"""
+        return self._store.global_scope()
 
     def _session_scope(self, event: AstrMessageEvent) -> memstore.ScopeStore:
         return self._store.session_scope(str(event.unified_msg_origin))
@@ -224,7 +228,7 @@ class MemoryBeyondPlugin(Star):
     ) -> memstore.ScopeStore | None:
         scope = (scope or "").strip().lower()
         if scope == "global":
-            return self._global_scope(event)
+            return self._global_scope()
         if scope == "session":
             return self._session_scope(event)
         return None
@@ -263,6 +267,10 @@ class MemoryBeyondPlugin(Star):
             state.cid = cid
             state.reset_compression()
             await self._save_state(umo, state)
+
+        # ---- 发送者标注：注入数字 ID，让记人不依赖可变可冒用的昵称 ----
+        if self._bool("annotate_sender", True):
+            self._annotate_sender(event, req)
 
         # ---- 记忆索引块（会话内快照，压缩后才会从磁盘刷新） ----
         memory_on = self._bool("enable_memory", True)
@@ -364,17 +372,33 @@ class MemoryBeyondPlugin(Star):
         except Exception:  # noqa: BLE001
             return ""
 
+    def _annotate_sender(
+        self, event: AstrMessageEvent, req: ProviderRequest
+    ) -> None:
+        """在用户消息开头注入 [发送者：数字ID｜昵称] 标注。
+
+        标注随消息进入会话历史，群聊里跨轮次也能分清谁说了什么；
+        LLM 记人时以标注中的数字 ID 为锚（昵称可变、可被冒用）。
+        """
+        prompt = str(req.prompt or "")
+        if not prompt or prompt.startswith(SENDER_TAG_PREFIX):
+            return
+        sender_id, sender_name = self._sender_identity(event)
+        if not sender_id:
+            return
+        tag = f"{SENDER_TAG_PREFIX}{sender_id}｜{sender_name or '未知昵称'}]"
+        req.prompt = f"{tag}\n{prompt}"
+
     async def _index_block(
         self, rt: RuntimeSession, event: AstrMessageEvent
     ) -> str | None:
-        user_key = self._user_key(event)
-        if user_key in rt.index_blocks:
-            return rt.index_blocks[user_key]
-        global_snap = await self._global_scope(event).load_index()
+        if rt.index_loaded:
+            return rt.index_block
+        global_snap = await self._global_scope().load_index()
         session_snap = await self._session_scope(event).load_index()
-        block = prompts.build_index_block(global_snap.text, session_snap.text)
-        rt.index_blocks[user_key] = block
-        return block
+        rt.index_block = prompts.build_index_block(global_snap.text, session_snap.text)
+        rt.index_loaded = True
+        return rt.index_block
 
     # ============================================================ 压缩执行
 
@@ -440,7 +464,8 @@ class MemoryBeyondPlugin(Star):
             await self._store_extracted(umo, drafts)
         # 压缩后从磁盘重新注入记忆索引：清空快照，下次请求重新加载。
         # 索引不是靠"被摘要保留下来"，而是每次从源头重新加载。
-        rt.index_blocks.clear()
+        rt.index_block = None
+        rt.index_loaded = False
 
     async def _store_extracted(
         self, umo: str, drafts: list[prompts.MemoryDraft]
@@ -635,8 +660,8 @@ class MemoryBeyondPlugin(Star):
         """读取长期记忆文件的完整内容。MEMORY.md 是该作用域的记忆索引；重写索引前必须先用本工具读取完整索引。
 
         Args:
-            scope(string): 作用域，global（跟随当前用户）或 session（跟随本会话）
-            file(string): 记忆文件名，默认 MEMORY.md，如 user-likes-concise.md
+            scope(string): 作用域，global（机器人自我的全局记忆）或 session（当前会话的记忆）
+            file(string): 记忆文件名，默认 MEMORY.md，如 user-12345678.md
         """
         if not self._bool("enable_memory", True):
             return "记忆功能已在插件配置中停用。"
@@ -659,11 +684,11 @@ class MemoryBeyondPlugin(Star):
         content: str = "",
         delete: bool = False,
     ) -> str:
-        """写入或删除长期记忆文件。写入事实文件后须同步维护该作用域 MEMORY.md 的索引行（一条记忆一行：- [标题](文件名.md) — 一句话钩子）；删除后须移除对应索引行。隐私边界：群聊中获得的信息默认写 session，只有确属当前用户本人且不涉及第三方的事实才可写 global。
+        """写入或删除长期记忆文件。写入事实文件后须同步维护该作用域 MEMORY.md 的索引行（一条记忆一行：- [标题](文件名.md) — 一句话钩子）；删除后须移除对应索引行。作用域边界：关于具体用户或本会话的信息一律写 session，记人以发送者标注中的数字 ID 为锚（文件名 user-<数字ID>.md，昵称只作正文附注）；global 只存机器人自身的偏好与行为准则。
 
         Args:
-            scope(string): 作用域，global（跟随当前用户）或 session（跟随本会话）
-            file(string): 记忆文件名，须以 .md 结尾，如 project-deadline.md
+            scope(string): 作用域，global（机器人自我的全局记忆）或 session（当前会话的记忆）
+            file(string): 记忆文件名，须以 .md 结尾，如 user-12345678.md
             content(string): 完整的文件内容（整文件覆盖写入；delete 为 false 时必填）
             delete(boolean): 设为 true 时删除该文件，此时忽略 content
         """
@@ -698,7 +723,7 @@ class MemoryBeyondPlugin(Star):
         scope = (scope or "all").strip().lower()
         stores: list[tuple[str, memstore.ScopeStore]] = []
         if scope in ("global", "all"):
-            stores.append(("global", self._global_scope(event)))
+            stores.append(("global", self._global_scope()))
         if scope in ("session", "all"):
             stores.append(("session", self._session_scope(event)))
         if not stores:
@@ -721,7 +746,7 @@ class MemoryBeyondPlugin(Star):
         rt = await self._runtime(umo)
         state = rt.state
         window, window_note = await self._resolve_window(event)
-        global_files = self._global_scope(event).list_files()
+        global_files = self._global_scope().list_files()
         session_files = self._session_scope(event).list_files()
         configured_id = self._str("summary_provider_id").strip() or "（未配置，用当前对话提供商）"
 
@@ -753,7 +778,8 @@ class MemoryBeyondPlugin(Star):
         rt = await self._runtime(umo)
         rt.state.reset_compression()
         rt.state.record_success()
-        rt.index_blocks.clear()
+        rt.index_block = None
+        rt.index_loaded = False
         await self._save_state(umo, rt.state)
         yield event.plain_result(
             "已清空本会话的压缩状态（摘要与水位线）。平台历史完整保留，"

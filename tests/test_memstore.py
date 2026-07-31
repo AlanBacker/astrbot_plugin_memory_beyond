@@ -145,10 +145,11 @@ def test_search_multi_term_and(tmp_path):
 
 def test_memory_store_scopes_isolated(tmp_path):
     store = MemoryStore(tmp_path)
-    g = store.global_scope("qq:1001")
+    g = store.global_scope()  # 机器人自我，全局唯一目录
     s = store.session_scope("qq:group:2002")
     run(g.write("me.md", "global fact"))
     run(s.write("me.md", "session fact"))
     assert run(g.read("me.md")) == "global fact"
     assert run(s.read("me.md")) == "session fact"
-    assert store.global_scope("qq:1001") is g  # 按键缓存
+    assert store.global_scope() is g  # 按键缓存
+    assert store.session_scope("qq:group:2002") is s
