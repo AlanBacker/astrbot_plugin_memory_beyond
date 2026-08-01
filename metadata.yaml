@@ -1,7 +1,7 @@
 name: astrbot_plugin_memory_beyond
 desc: 使用索引式档案存储的方案，为你的聊天机器人加上更好的记忆系统，无需Embedding模型；自带上下文压缩方案，使用前请阅读README开头字段！
 help: 装上即用。机器人会自己调用 memory_read / memory_write / memory_search 工具读写记忆；上下文快满时自动摘要压缩。建议在插件配置中填写 max_context_tokens（模型上下文窗口大小），并按 README 调整 AstrBot 的两处内置设置。管理员指令：/mb_status 查看状态，/mb_reset 重置本会话压缩状态，/mb_probe 测试摘要链路。
-version: v1.2.2
+version: v1.2.3
 author: AlanBacker
 repo: "https://github.com/AlanBacker/astrbot_plugin_memory_beyond"
 display_name: Memory Beyond

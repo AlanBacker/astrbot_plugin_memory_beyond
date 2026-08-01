@@ -83,7 +83,6 @@ class RuntimeSession:
     state: compress.SessionState
     index_block: str | None = None
     index_loaded: bool = False
-    last_estimate: int = 0
     awaiting_calibration: bool = False
     warned_window: bool = False
     warned_summarizer: bool = False
@@ -397,12 +396,14 @@ class MemoryBeyondPlugin(Star):
         if guidance and guidance not in str(req.system_prompt or ""):
             req.system_prompt = str(req.system_prompt or "") + guidance
 
-        rt.last_estimate = (
+        state.last_estimate = (
             overhead
             + estimator.text(state.summary)
             + estimator.messages(tail)
         )
         rt.awaiting_calibration = True
+        # 估算值随状态落盘，重启/重载插件后 mb_status 仍能给出上一次的统计
+        await self._save_state(umo, state)
 
     async def _conversation_id(
         self, event: AstrMessageEvent, req: ProviderRequest
@@ -693,9 +694,11 @@ class MemoryBeyondPlugin(Star):
         try:
             umo = str(getattr(event, "unified_msg_origin", ""))
             rt = self._sessions.get(umo)
-            if rt is None or not rt.awaiting_calibration or rt.last_estimate <= 0:
+            if rt is None or not rt.awaiting_calibration:
                 return
             rt.awaiting_calibration = False
+            if rt.state.last_estimate <= 0:
+                return
             raw = getattr(resp, "raw_completion", None)
             usage = (
                 raw.get("usage") if isinstance(raw, dict)
@@ -727,7 +730,7 @@ class MemoryBeyondPlugin(Star):
             old_ratio = state.ratio
             old_cache_hit = state.cache_hit_tokens
             estimator = tokens.TokenEstimator(state.ratio)
-            estimator.calibrate(rt.last_estimate, actual)
+            estimator.calibrate(state.last_estimate, actual)
             state.ratio = estimator.ratio
             state.cache_hit_tokens = -1 if cache_hit is None else cache_hit
             # 校准结果落盘，重启后不回退；比例漂移小且缓存命中数没变时跳过，
@@ -858,7 +861,7 @@ class MemoryBeyondPlugin(Star):
             f"上下文窗口：{window if window > 0 else '未知'}（{window_note}）",
             f"触发阈值：{self._threshold()}，压缩目标：{self._target_ratio()}",
             f"水位线：{state.watermark}，摘要：{len(state.summary)} 字",
-            f"最近一次请求估算：{rt.last_estimate} tokens（校准比例 {state.ratio:.2f}）",
+            f"最近一次请求估算：{state.last_estimate} tokens（校准比例 {state.ratio:.2f}）",
             "最近一次缓存命中："
             + (
                 f"{state.cache_hit_tokens} tokens"
