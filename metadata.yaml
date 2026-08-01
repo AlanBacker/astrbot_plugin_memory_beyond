@@ -4,6 +4,6 @@ help: 装上即用。机器人会自己调用 memory_read / memory_write / memor
 version: v1.2.7
 author: AlanBacker
 repo: "https://github.com/AlanBacker/astrbot_plugin_memory_beyond"
-display_name: Memory Beyond
+display_name: Memory Beyond增强记忆
 short_desc: 用更好的方案让机器人记住人和事，聊再久也不失忆。
 astrbot_version: ">=4.5.7"
