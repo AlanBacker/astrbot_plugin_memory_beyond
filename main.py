@@ -835,6 +835,50 @@ class MemoryBeyondPlugin(Star):
 
     # ============================================================ 管理指令
 
+    async def _estimate_live(self, event: AstrMessageEvent, rt: RuntimeSession) -> int:
+        """无估算记录时（如旧版本升级来的会话），从平台存储的历史现场估算。
+
+        拿不到请求现场的人格提示词与本轮输入，结果略低于请求路径的口径。
+        """
+        state = rt.state
+        try:
+            umo = str(event.unified_msg_origin)
+            mgr = self.context.conversation_manager
+            cid = await mgr.get_curr_conversation_id(umo)
+            if not cid:
+                return 0
+            conversation = await mgr.get_conversation(umo, str(cid))
+            raw = getattr(conversation, "history", "") or "[]"
+            data = json.loads(raw) if isinstance(raw, str) else raw
+            if not isinstance(data, list):
+                return 0
+            contexts = [m for m in data if isinstance(m, dict)]
+        except Exception:  # noqa: BLE001
+            logger.debug(LOG_PREFIX + "现场估算读取历史失败", exc_info=True)
+            return 0
+        if not contexts:
+            return 0
+        memory_on = self._bool("enable_memory", True)
+        estimator = tokens.TokenEstimator(state.ratio)
+        n_system = split_leading_system(contexts)
+        if compress.state_matches(state, str(cid), contexts) and state.watermark:
+            mark = max(state.watermark, n_system)
+        else:
+            mark = n_system
+        total = (
+            estimator.messages(contexts[:n_system])
+            + estimator.text(prompts.MEMORY_GUIDANCE if memory_on else "")
+            + TOOL_SCHEMA_ALLOWANCE
+            + estimator.text(state.summary)
+            + estimator.messages(contexts[mark:])
+        )
+        if memory_on:
+            block = await self._index_block(rt, event)
+            if block:
+                index_msg = prompts.build_index_message(block)
+                total += estimator.text(index_msg["content"]) + tokens.MESSAGE_OVERHEAD
+        return total
+
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("mb_status")
     async def show_status(self, event: AstrMessageEvent):
@@ -853,6 +897,22 @@ class MemoryBeyondPlugin(Star):
             if state.in_cooldown(now)
             else "正常"
         )
+        if state.last_estimate > 0:
+            estimate_line = (
+                f"最近一次请求估算：{state.last_estimate} tokens"
+                f"（校准比例 {state.ratio:.2f}）"
+            )
+        else:
+            live = await self._estimate_live(event, rt)
+            if live > 0:
+                estimate_line = (
+                    f"当前上下文现场估算：{live} tokens"
+                    f"（校准比例 {state.ratio:.2f}，未含人格提示词与本轮输入）"
+                )
+            else:
+                estimate_line = (
+                    f"最近一次请求估算：0 tokens（校准比例 {state.ratio:.2f}）"
+                )
         lines = [
             "Memory Beyond 状态",
             f"记忆：{'启用' if self._bool('enable_memory', True) else '停用'}"
@@ -861,7 +921,7 @@ class MemoryBeyondPlugin(Star):
             f"上下文窗口：{window if window > 0 else '未知'}（{window_note}）",
             f"触发阈值：{self._threshold()}，压缩目标：{self._target_ratio()}",
             f"水位线：{state.watermark}，摘要：{len(state.summary)} 字",
-            f"最近一次请求估算：{state.last_estimate} tokens（校准比例 {state.ratio:.2f}）",
+            estimate_line,
             "最近一次缓存命中："
             + (
                 f"{state.cache_hit_tokens} tokens"
