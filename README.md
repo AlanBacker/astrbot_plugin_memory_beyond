@@ -1,4 +1,4 @@
-# Memory Beyond增强记忆
+# Memory Beyond 增强记忆
 
 ## ⚠️ 使用前必读：先完成这几步设置
 
