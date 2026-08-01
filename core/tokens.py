@@ -92,6 +92,38 @@ def estimate_messages(messages: list[dict] | None) -> int:
     return sum(estimate_message(m) for m in messages if isinstance(m, dict))
 
 
+def _usage_field(obj: Any, key: str) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(key)
+    return getattr(obj, key, None)
+
+
+# 各家 provider 上报缓存命中的字段名不同，逐个探测。
+_CACHE_HIT_KEYS = (
+    "prompt_cache_hit_tokens",  # DeepSeek
+    "cache_read_input_tokens",  # Anthropic 系
+    "cached_content_token_count",  # Gemini 系
+)
+
+
+def extract_cache_hit(usage: Any) -> int | None:
+    """从 usage（dict 或对象）提取提示词缓存命中的 token 数，未上报返回 None。"""
+    if usage is None:
+        return None
+    candidates = [_usage_field(usage, key) for key in _CACHE_HIT_KEYS]
+    details = _usage_field(usage, "prompt_tokens_details")  # OpenAI 系
+    if details is not None:
+        candidates.append(_usage_field(details, "cached_tokens"))
+    for value in candidates:
+        if value is None:
+            continue
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 class TokenEstimator:
     """带校准的估算器。
 

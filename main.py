@@ -691,7 +691,8 @@ class MemoryBeyondPlugin(Star):
     async def calibrate_tokens(self, event: AstrMessageEvent, resp: LLMResponse):
         """provider 返回真实用量时，用真实值校准估算比例（优先用真实值）。"""
         try:
-            rt = self._sessions.get(str(getattr(event, "unified_msg_origin", "")))
+            umo = str(getattr(event, "unified_msg_origin", ""))
+            rt = self._sessions.get(umo)
             if rt is None or not rt.awaiting_calibration or rt.last_estimate <= 0:
                 return
             rt.awaiting_calibration = False
@@ -703,9 +704,21 @@ class MemoryBeyondPlugin(Star):
             actual = int(actual or 0)
             if actual <= 0:
                 return
-            estimator = tokens.TokenEstimator(rt.state.ratio)
+            state = rt.state
+            old_ratio = state.ratio
+            old_cache_hit = state.cache_hit_tokens
+            estimator = tokens.TokenEstimator(state.ratio)
             estimator.calibrate(rt.last_estimate, actual)
-            rt.state.ratio = estimator.ratio
+            state.ratio = estimator.ratio
+            cache_hit = tokens.extract_cache_hit(usage)
+            state.cache_hit_tokens = -1 if cache_hit is None else cache_hit
+            # 校准结果落盘，重启后不回退；比例漂移小且缓存命中数没变时跳过，
+            # 避免收敛后每轮响应都写盘。
+            if (
+                abs(state.ratio - old_ratio) > 0.005
+                or state.cache_hit_tokens != old_cache_hit
+            ):
+                await self._save_state(umo, state)
         except Exception:  # noqa: BLE001
             logger.debug(LOG_PREFIX + "token 校准失败", exc_info=True)
 
@@ -828,6 +841,12 @@ class MemoryBeyondPlugin(Star):
             f"触发阈值：{self._threshold()}，压缩目标：{self._target_ratio()}",
             f"水位线：{state.watermark}，摘要：{len(state.summary)} 字",
             f"最近一次请求估算：{rt.last_estimate} tokens（校准比例 {state.ratio:.2f}）",
+            "最近一次缓存命中："
+            + (
+                f"{state.cache_hit_tokens} tokens"
+                if state.cache_hit_tokens >= 0
+                else "提供商未上报"
+            ),
             f"摘要提供商：{configured_id}",
             f"摘要链路：{cooldown}",
         ]

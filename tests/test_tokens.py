@@ -1,4 +1,5 @@
 import math
+from types import SimpleNamespace
 
 from core import tokens
 
@@ -70,3 +71,31 @@ def test_estimator_bad_init_ratio_resets():
 def test_estimator_scales_text():
     est = tokens.TokenEstimator(2.0)
     assert est.text("hello") == math.ceil(tokens.estimate_text("hello") * 2.0)
+
+
+# ---------------------------------------------------------------- 缓存命中提取
+
+
+def test_extract_cache_hit_flat_keys():
+    assert tokens.extract_cache_hit({"prompt_cache_hit_tokens": 128}) == 128
+    assert tokens.extract_cache_hit({"cache_read_input_tokens": 64}) == 64
+    assert tokens.extract_cache_hit({"cached_content_token_count": 32}) == 32
+
+
+def test_extract_cache_hit_openai_nested():
+    usage = {"prompt_tokens": 500, "prompt_tokens_details": {"cached_tokens": 256}}
+    assert tokens.extract_cache_hit(usage) == 256
+
+
+def test_extract_cache_hit_object_usage():
+    details = SimpleNamespace(cached_tokens=77)
+    usage = SimpleNamespace(prompt_tokens=100, prompt_tokens_details=details)
+    assert tokens.extract_cache_hit(usage) == 77
+    assert tokens.extract_cache_hit(SimpleNamespace(prompt_cache_hit_tokens=5)) == 5
+
+
+def test_extract_cache_hit_absent_or_invalid():
+    assert tokens.extract_cache_hit(None) is None
+    assert tokens.extract_cache_hit({"prompt_tokens": 100}) is None
+    assert tokens.extract_cache_hit({"prompt_cache_hit_tokens": "junk"}) is None
+    assert tokens.extract_cache_hit({"prompt_cache_hit_tokens": -3}) == 0

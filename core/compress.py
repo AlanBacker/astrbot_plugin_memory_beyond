@@ -53,6 +53,8 @@ class SessionState:
     summary: str = ""
     anchor: str = ""
     ratio: float = 1.0
+    # 最近一次请求命中提示词缓存的 token 数；-1 表示提供商未上报。
+    cache_hit_tokens: int = -1
     fail_count: int = 0
     fail_until: float = 0.0
     compressed_at: float = 0.0
@@ -64,6 +66,7 @@ class SessionState:
             "summary": self.summary,
             "anchor": self.anchor,
             "ratio": self.ratio,
+            "cache_hit_tokens": self.cache_hit_tokens,
             "fail_count": self.fail_count,
             "fail_until": self.fail_until,
             "compressed_at": self.compressed_at,
@@ -80,6 +83,7 @@ class SessionState:
         try:
             state.watermark = max(0, int(raw.get("watermark", 0)))
             state.ratio = float(raw.get("ratio", 1.0))
+            state.cache_hit_tokens = max(-1, int(raw.get("cache_hit_tokens", -1)))
             state.fail_count = max(0, int(raw.get("fail_count", 0)))
             state.fail_until = float(raw.get("fail_until", 0.0))
             state.compressed_at = float(raw.get("compressed_at", 0.0))

@@ -138,7 +138,9 @@ def test_record_failure_exponential_backoff():
 
 
 def test_state_roundtrip():
-    state = SessionState(cid="c1", watermark=5, summary="s", anchor="a", ratio=1.2)
+    state = SessionState(
+        cid="c1", watermark=5, summary="s", anchor="a", ratio=1.2, cache_hit_tokens=321
+    )
     restored = SessionState.from_dict(state.to_dict())
     assert restored == state
 
@@ -147,6 +149,11 @@ def test_state_from_garbage():
     state = SessionState.from_dict({"watermark": "abc", "ratio": "x"})
     assert state.watermark == 0 and state.ratio == 1.0
     assert SessionState.from_dict("junk") == SessionState()
+
+
+def test_state_cache_hit_default_and_clamp():
+    assert SessionState.from_dict({}).cache_hit_tokens == -1
+    assert SessionState.from_dict({"cache_hit_tokens": -99}).cache_hit_tokens == -1
 
 
 # ---------------------------------------------------------------- 应急裁剪
