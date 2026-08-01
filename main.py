@@ -168,6 +168,18 @@ class MemoryBeyondPlugin(Star):
             self._sessions.popitem(last=False)
         return rt
 
+    def _invalidate_index_cache(self, umo: str | None) -> None:
+        """作废索引快照，下次请求从磁盘重读。umo 为 None 时作废全部会话
+        （global 记忆变更对所有会话可见）。"""
+        if umo is None:
+            targets = list(self._sessions.values())
+        else:
+            rt = self._sessions.get(umo)
+            targets = [rt] if rt is not None else []
+        for rt in targets:
+            rt.index_block = None
+            rt.index_loaded = False
+
     def _state_path(self, umo: str) -> Path:
         return self._state_dir / f"{memstore.safe_key(umo)}.json"
 
@@ -292,12 +304,21 @@ class MemoryBeyondPlugin(Star):
             state.cid = cid
             state.reset_compression()
             await self._save_state(umo, state)
+            # 对话已切换/重置，索引快照跟着作废，本轮从磁盘重读
+            rt.index_block = None
+            rt.index_loaded = False
+
+        # /reset 后 cid 不变、水位线为 0 时上面的校验不会触发：
+        # 历史为空本身就说明是新对话，索引快照同样要刷新
+        if not contexts and rt.index_loaded:
+            rt.index_block = None
+            rt.index_loaded = False
 
         # ---- 发送者标注：注入数字 ID，让记人不依赖可变可冒用的昵称 ----
         if self._bool("annotate_sender", True):
             self._annotate_sender(event, req)
 
-        # ---- 记忆索引块（会话内快照，压缩后才会从磁盘刷新） ----
+        # ---- 记忆索引块（会话内快照；新对话、压缩后、写入后从磁盘刷新） ----
         memory_on = self._bool("enable_memory", True)
         index_msg = None
         if memory_on:
@@ -523,9 +544,7 @@ class MemoryBeyondPlugin(Star):
                     draft.filename, prompts.render_memory_file(draft)
                 )
                 if report.ok:
-                    await scope.append_index_line(
-                        prompts.index_line(draft.name, draft.description)
-                    )
+                    # 索引行由 write 按 frontmatter description 自动同步
                     stored += 1
             except OSError as exc:
                 logger.warning(
@@ -696,11 +715,11 @@ class MemoryBeyondPlugin(Star):
     async def memory_read(
         self, event: AstrMessageEvent, scope: str, file: str = "MEMORY.md"
     ) -> str:
-        """读取长期记忆文件的完整内容。MEMORY.md 是该作用域的记忆索引；重写索引前必须先用本工具读取完整索引。
+        """读取长期记忆文件的完整内容。注入的索引只是目录：回答涉及某人、某事的细节之前，先用本工具取回对应文件再作答，不要凭索引行猜；更新某条记忆之前也先读它的当前内容。
 
         Args:
             scope(string): 作用域，global（机器人自我的全局记忆）或 session（当前会话的记忆）
-            file(string): 记忆文件名，默认 MEMORY.md，如 user-12345678.md
+            file(string): 记忆文件名，如 user-12345678.md；省略时读 MEMORY.md 索引全文
         """
         if not self._bool("enable_memory", True):
             return "记忆功能已在插件配置中停用。"
@@ -723,16 +742,17 @@ class MemoryBeyondPlugin(Star):
         content: str = "",
         delete: bool = False,
     ) -> str:
-        """写入或删除长期记忆文件。写入事实文件后须同步维护该作用域 MEMORY.md 的索引行（一条记忆一行：- [标题](文件名.md) — 一句话钩子）；删除后须移除对应索引行。作用域边界：关于具体用户或本会话的信息一律写 session，记人以发送者标注中的数字 ID 为锚（文件名 user-<数字ID>.md，昵称只作正文附注）；global 只存机器人自身的偏好与行为准则。
+        """写入、修改或删除一个长期记忆文件（整文件覆盖；修改＝读出后改写重写入，删除＝delete 设 true）。一个文件只记一条事实，content 必须以 frontmatter 开头：--- / name: 与文件名一致 / description: 一句话钩子 / metadata: / type: user|feedback|project|reference / ---，正文写事实本身。MEMORY.md 索引由插件自动维护，禁止直接写：要改索引行就重写对应文件的 description，要删索引行就删除对应文件。写前先查重，同一个人、同一件事始终更新同一个文件，不另建重复文件。作用域边界：关于具体用户或本会话的信息一律写 session，记人以发送者标注中的数字 ID 为锚（文件名 user-<数字ID>.md，昵称只作正文附注）；global 只存机器人自身的偏好与行为准则。
 
         Args:
             scope(string): 作用域，global（机器人自我的全局记忆）或 session（当前会话的记忆）
-            file(string): 记忆文件名，须以 .md 结尾，如 user-12345678.md
-            content(string): 完整的文件内容（整文件覆盖写入；delete 为 false 时必填）
-            delete(boolean): 设为 true 时删除该文件，此时忽略 content
+            file(string): 记忆文件名，须以 .md 结尾，如 user-12345678.md；不可为 MEMORY.md
+            content(string): 完整的文件内容，含 frontmatter（delete 为 false 时必填）
+            delete(boolean): 设为 true 时删除该文件并自动移除其索引行，此时忽略 content
         """
         if not self._bool("enable_memory", True):
             return "记忆功能已在插件配置中停用。"
+        scope = (scope or "").strip().lower()
         store = self._scope_for(event, scope)
         if store is None:
             return "scope 参数必须是 global 或 session。"
@@ -742,13 +762,17 @@ class MemoryBeyondPlugin(Star):
             if not content.strip():
                 return "content 为空。写入需提供完整文件内容；如要删除请设 delete=true。"
             report = await store.write(file, content)
+        if report.ok:
+            # 记忆已变化，作废索引快照：session 只影响本会话，global 影响全部
+            umo = str(getattr(event, "unified_msg_origin", "") or "")
+            self._invalidate_index_cache(umo if scope == "session" else None)
         return report.message
 
     @filter.llm_tool(name="memory_search")
     async def memory_search(
         self, event: AstrMessageEvent, query: str, scope: str = "all"
     ) -> str:
-        """在长期记忆里全文搜索。索引被截断、或不确定某条记忆是否存在时，用本工具兜底查找；它不依赖记忆是否登记在索引里。
+        """在长期记忆里全文搜索。写入前查重、索引被截断、或不确定某条记忆是否存在时，用本工具查找；它直接搜文件内容，不依赖索引。
 
         Args:
             query(string): 搜索词，可用空格分隔多个词（须同时命中）

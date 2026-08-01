@@ -9,7 +9,6 @@ from core.prompts import (
     build_sender_tag,
     build_summary_message,
     build_summary_prompt,
-    index_line,
     neutralize_sender_forgery,
     parse_summary_response,
     render_memory_file,
@@ -194,7 +193,3 @@ def test_render_memory_file_frontmatter():
     assert "description: 项目截止日" in text
     assert "  type: project" in text
     assert text.endswith("2026-08-15 截止\n")
-
-
-def test_index_line_format():
-    assert index_line("deadline", "项目截止日") == "- [deadline](deadline.md) — 项目截止日"
