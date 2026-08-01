@@ -39,7 +39,8 @@ LOG_PREFIX = "[memory_beyond] "
 # 摘要提供商回退链中，当前对话提供商作为兜底时的尝试次数
 # （作为首选时按配置的 summary_retry_count）。
 FALLBACK_ATTEMPTS = 2
-# 函数工具 schema、人设开场白等无法逐项估算的部分，给一个固定余量。
+# 拿不到本轮工具声明时（结构异常等）估算工具 schema 的兜底余量；
+# 正常路径按 req.func_tool 的实际 schema 序列化后实测。
 TOOL_SCHEMA_ALLOWANCE = 800
 # 应急裁剪时留给正文消息的最小预算。
 MIN_TAIL_BUDGET = 1000
@@ -71,6 +72,24 @@ MODEL_WINDOWS: list[tuple[str, int]] = [
     ("grok", 128_000),
     ("doubao", 128_000),
 ]
+
+
+def tool_schema_cost(toolset, estimator: tokens.TokenEstimator) -> int:
+    """实测本轮声明的工具 schema 占用；没有工具为 0，读取失败退回固定余量。
+
+    provider 发给 API 的就是 openai_schema() 的序列化结果（其余厂商格式
+    同量级），照实测比猜一个常数可靠——工具的数量和描述长短因装的插件
+    而异，差距可以数以千计。
+    """
+    if toolset is None:
+        return 0
+    try:
+        if toolset.empty():
+            return 0
+        payload = json.dumps(toolset.openai_schema(), ensure_ascii=False)
+        return estimator.text(payload)
+    except Exception:  # noqa: BLE001
+        return estimator.scale(TOOL_SCHEMA_ALLOWANCE)
 
 
 @dataclass
@@ -348,14 +367,12 @@ class MemoryBeyondPlugin(Star):
             estimator.messages(contexts[:n_system])
             + estimator.text(str(req.system_prompt or "") + guidance)
             + estimator.text(str(req.prompt or ""))
-            + len(getattr(req, "image_urls", None) or []) * tokens.IMAGE_TOKENS
-            + TOOL_SCHEMA_ALLOWANCE
+            + estimator.scale(
+                len(getattr(req, "image_urls", None) or []) * tokens.IMAGE_TOKENS
+            )
         )
-        index_cost = (
-            estimator.text(index_msg["content"]) + tokens.MESSAGE_OVERHEAD
-            if index_msg
-            else 0
-        )
+        tools_cost = tool_schema_cost(getattr(req, "func_tool", None), estimator)
+        index_cost = estimator.messages([index_msg]) if index_msg else 0
 
         def current_tail() -> list[dict]:
             mark = max(state.watermark, n_system) if state.watermark else n_system
@@ -373,6 +390,7 @@ class MemoryBeyondPlugin(Star):
         if compress_on and window > 0:
             total = (
                 overhead
+                + tools_cost
                 + index_cost
                 + estimator.text(state.summary)
                 + estimator.messages(tail)
@@ -387,6 +405,7 @@ class MemoryBeyondPlugin(Star):
             budget = (
                 int(window * self._target_ratio())
                 - overhead
+                - tools_cost
                 - index_cost
                 - estimator.text(state.summary)
             )
@@ -406,23 +425,29 @@ class MemoryBeyondPlugin(Star):
                     logger.warning(message)
 
         # ---- 拼装发送视图：system 消息 + 索引块 + 摘要块 + 原文尾部 ----
+        summary_msg = (
+            prompts.build_summary_message(state.summary) if state.summary else None
+        )
         view = list(contexts[:n_system])
         if index_msg:
             view.append(index_msg)
-        if state.summary:
-            view.append(prompts.build_summary_message(state.summary))
+        if summary_msg:
+            view.append(summary_msg)
         view.extend(tail)
         req.contexts = view
 
         if guidance and guidance not in str(req.system_prompt or ""):
             req.system_prompt = str(req.system_prompt or "") + guidance
 
-        summary_cost = estimator.text(state.summary)
+        summary_cost = estimator.messages([summary_msg]) if summary_msg else 0
         tail_cost = estimator.messages(tail)
-        state.last_estimate = overhead + index_cost + summary_cost + tail_cost
+        state.last_estimate = (
+            overhead + tools_cost + index_cost + summary_cost + tail_cost
+        )
         # 分项构成随估算落盘，mb_status 用它解释数值由什么组成
         state.last_parts = {
             "overhead": overhead,
+            "tools": tools_cost,
             "index": index_cost,
             "summary": summary_cost,
             "history": tail_cost,
@@ -758,6 +783,8 @@ class MemoryBeyondPlugin(Star):
             estimator = tokens.TokenEstimator(state.ratio)
             estimator.calibrate(state.last_estimate, actual)
             state.ratio = estimator.ratio
+            # 真实上报值记下来，mb_status 里与估算并排展示可直接对照
+            state.last_actual = actual
             state.cache_hit_tokens = -1 if cache_hit is None else cache_hit
             # 校准结果落盘，重启后不回退；比例漂移小且缓存命中数没变时跳过，
             # 避免收敛后每轮响应都写盘。
@@ -903,18 +930,32 @@ class MemoryBeyondPlugin(Star):
         if memory_on:
             block = await self._index_block(rt, event)
             if block:
-                index_msg = prompts.build_index_message(block)
-                index_cost = (
-                    estimator.text(index_msg["content"]) + tokens.MESSAGE_OVERHEAD
-                )
+                index_cost = estimator.messages([prompts.build_index_message(block)])
+        # 工具声明取全局工具管理器里的启用工具（近似请求现场的 func_tool）
+        try:
+            toolset = self.context.get_llm_tool_manager().get_full_tool_set()
+            for tool in list(toolset):
+                if not getattr(tool, "active", True):
+                    toolset.remove_tool(tool.name)
+        except Exception:  # noqa: BLE001
+            toolset = None
+        tools_cost = (
+            tool_schema_cost(toolset, estimator)
+            if toolset is not None
+            else estimator.scale(TOOL_SCHEMA_ALLOWANCE)
+        )
         parts = {
             "overhead": (
                 estimator.messages(contexts[:n_system])
                 + estimator.text(prompts.MEMORY_GUIDANCE if memory_on else "")
-                + TOOL_SCHEMA_ALLOWANCE
             ),
+            "tools": tools_cost,
             "index": index_cost,
-            "summary": estimator.text(state.summary),
+            "summary": (
+                estimator.messages([prompts.build_summary_message(state.summary)])
+                if state.summary
+                else 0
+            ),
             "history": estimator.messages(contexts[mark:]),
         }
         return sum(parts.values()), parts
@@ -960,9 +1001,15 @@ class MemoryBeyondPlugin(Star):
         if parts:
             estimate_lines.append(
                 f"　构成：固定开销 {parts.get('overhead', 0)}"
+                f" + 工具声明 {parts.get('tools', 0)}"
                 f" + 记忆索引 {parts.get('index', 0)}"
                 f" + 摘要 {parts.get('summary', 0)}"
                 f" + 历史原文 {parts.get('history', 0)}"
+            )
+        if state.last_actual > 0:
+            estimate_lines.append(
+                f"最近一次实际上报：{state.last_actual} tokens"
+                "（提供商 usage，估算校准以它为准）"
             )
         lines = [
             "Memory Beyond 状态",

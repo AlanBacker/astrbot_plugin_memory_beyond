@@ -61,10 +61,12 @@ class SessionState:
     ratio: float = 1.0
     # 最近一次请求的 token 估算值。
     last_estimate: int = 0
-    # 最近一次估算的分项构成：overhead（固定开销）/ index（索引块）/
-    # summary（摘要）/ history（历史原文），四项之和即 last_estimate；
-    # 空字典表示尚无记录（如旧版本升级来的状态文件）。
+    # 最近一次估算的分项构成：overhead（固定开销）/ tools（工具声明）/
+    # index（索引块）/ summary（摘要）/ history（历史原文），各项之和即
+    # last_estimate；空字典表示尚无记录（如旧版本升级来的状态文件）。
     last_parts: dict = field(default_factory=dict)
+    # 最近一次提供商上报的真实 prompt_tokens；0 表示尚无记录。
+    last_actual: int = 0
     # 最近一次请求命中提示词缓存的 token 数；-1 表示提供商未上报。
     cache_hit_tokens: int = -1
     fail_count: int = 0
@@ -80,6 +82,7 @@ class SessionState:
             "ratio": self.ratio,
             "last_estimate": self.last_estimate,
             "last_parts": dict(self.last_parts),
+            "last_actual": self.last_actual,
             "cache_hit_tokens": self.cache_hit_tokens,
             "fail_count": self.fail_count,
             "fail_until": self.fail_until,
@@ -98,6 +101,7 @@ class SessionState:
             state.watermark = max(0, int(raw.get("watermark", 0)))
             state.ratio = float(raw.get("ratio", 1.0))
             state.last_estimate = max(0, int(raw.get("last_estimate", 0)))
+            state.last_actual = max(0, int(raw.get("last_actual", 0)))
             state.cache_hit_tokens = max(-1, int(raw.get("cache_hit_tokens", -1)))
             state.fail_count = max(0, int(raw.get("fail_count", 0)))
             state.fail_until = float(raw.get("fail_until", 0.0))
@@ -109,7 +113,7 @@ class SessionState:
         raw_parts = raw.get("last_parts")
         if isinstance(raw_parts, dict):
             parts: dict = {}
-            for key in ("overhead", "index", "summary", "history"):
+            for key in ("overhead", "tools", "index", "summary", "history"):
                 try:
                     parts[key] = max(0, int(raw_parts.get(key, 0)))
                 except (TypeError, ValueError):

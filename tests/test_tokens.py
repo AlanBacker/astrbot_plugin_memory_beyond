@@ -99,3 +99,19 @@ def test_extract_cache_hit_absent_or_invalid():
     assert tokens.extract_cache_hit({"prompt_tokens": 100}) is None
     assert tokens.extract_cache_hit({"prompt_cache_hit_tokens": "junk"}) is None
     assert tokens.extract_cache_hit({"prompt_cache_hit_tokens": -3}) == 0
+
+
+def test_calibrate_converges_to_absolute_ratio():
+    # 真实用量恒为原始估算的 1.37 倍时，比例应收敛到 1.37 本身。
+    # 回归防护：若拿 真实/已校准估算 直接做 EMA，收敛点会是 sqrt(1.37)≈1.17
+    # （残差因子等于比例本身时即停），估算永远系统性偏低约 15%。
+    est = tokens.TokenEstimator(1.0)
+    raw = 5000
+    for _ in range(40):
+        est.calibrate(est.scale(raw), int(raw * 1.37))
+    assert abs(est.ratio - 1.37) < 0.02
+
+
+def test_scale_applies_ratio():
+    assert tokens.TokenEstimator(1.5).scale(800) == 1200
+    assert tokens.TokenEstimator(1.0).scale(800) == 800

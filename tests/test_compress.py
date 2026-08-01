@@ -287,10 +287,17 @@ def test_reconcile_anchor_mismatch_without_summary_resets():
 
 
 def test_last_parts_roundtrip():
-    state = SessionState(cid="c1", last_estimate=100)
-    state.last_parts = {"overhead": 60, "index": 10, "summary": 20, "history": 10}
+    state = SessionState(cid="c1", last_estimate=100, last_actual=117)
+    state.last_parts = {
+        "overhead": 55,
+        "tools": 5,
+        "index": 10,
+        "summary": 20,
+        "history": 10,
+    }
     restored = SessionState.from_dict(state.to_dict())
     assert restored.last_parts == state.last_parts
+    assert restored.last_actual == 117
     assert restored == state
 
 
@@ -298,8 +305,14 @@ def test_last_parts_tolerates_garbage():
     raw = SessionState(cid="c1").to_dict()
     raw["last_parts"] = {"overhead": "abc", "index": -5, "summary": 3, "extra": 9}
     state = SessionState.from_dict(raw)
-    # 坏值归零、未知键忽略，但有效项保留
-    assert state.last_parts == {"overhead": 0, "index": 0, "summary": 3, "history": 0}
+    # 坏值归零、未知键忽略，缺失键补零，有效项保留
+    assert state.last_parts == {
+        "overhead": 0,
+        "tools": 0,
+        "index": 0,
+        "summary": 3,
+        "history": 0,
+    }
     raw["last_parts"] = "not a dict"
     assert SessionState.from_dict(raw).last_parts == {}
 
@@ -310,3 +323,8 @@ def test_last_parts_missing_or_all_zero_stays_empty():
     assert SessionState.from_dict(raw).last_parts == {}
     raw["last_parts"] = {"overhead": 0, "index": 0, "summary": 0, "history": 0}
     assert SessionState.from_dict(raw).last_parts == {}
+
+
+def test_last_actual_clamped():
+    assert SessionState.from_dict({"last_actual": -3}).last_actual == 0
+    assert SessionState.from_dict({}).last_actual == 0
