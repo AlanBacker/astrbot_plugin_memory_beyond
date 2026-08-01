@@ -696,12 +696,31 @@ class MemoryBeyondPlugin(Star):
             if rt is None or not rt.awaiting_calibration or rt.last_estimate <= 0:
                 return
             rt.awaiting_calibration = False
-            usage = getattr(getattr(resp, "raw_completion", None), "usage", None)
+            raw = getattr(resp, "raw_completion", None)
+            usage = (
+                raw.get("usage") if isinstance(raw, dict)
+                else getattr(raw, "usage", None)
+            )
             if isinstance(usage, dict):
                 actual = usage.get("prompt_tokens")
             else:
                 actual = getattr(usage, "prompt_tokens", None)
-            actual = int(actual or 0)
+            try:
+                actual = int(actual or 0)
+            except (TypeError, ValueError):
+                actual = 0
+            cache_hit = tokens.extract_cache_hit(usage)
+            if actual <= 0:
+                # 原始响应缺 usage 时（部分流式/代理场景），回退 AstrBot 归一化的
+                # TokenUsage。它把"未上报"也归为 0，所以缓存命中仅在 >0 时采信。
+                normalized = getattr(resp, "usage", None)
+                if normalized is not None:
+                    try:
+                        actual = int(getattr(normalized, "input", 0) or 0)
+                        cached = int(getattr(normalized, "input_cached", 0) or 0)
+                        cache_hit = cached if cached > 0 else None
+                    except (TypeError, ValueError):
+                        actual = 0
             if actual <= 0:
                 return
             state = rt.state
@@ -710,7 +729,6 @@ class MemoryBeyondPlugin(Star):
             estimator = tokens.TokenEstimator(state.ratio)
             estimator.calibrate(rt.last_estimate, actual)
             state.ratio = estimator.ratio
-            cache_hit = tokens.extract_cache_hit(usage)
             state.cache_hit_tokens = -1 if cache_hit is None else cache_hit
             # 校准结果落盘，重启后不回退；比例漂移小且缓存命中数没变时跳过，
             # 避免收敛后每轮响应都写盘。
