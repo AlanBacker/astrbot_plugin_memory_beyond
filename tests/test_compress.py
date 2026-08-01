@@ -227,3 +227,86 @@ def test_render_transcript_truncates_long_tool_output():
     messages = [{"role": "tool", "content": "x" * 10_000}]
     text = compress.render_transcript(messages)
     assert len(text) < 3000 and "截断" in text
+
+
+# ---------------------------------------------------------------- 状态对齐
+
+
+def test_reconcile_cid_switch_resets():
+    contexts = _history()
+    state = SessionState(cid="c1", watermark=3, summary="s", anchor="a")
+    assert compress.reconcile(state, "c2", contexts) == compress.RECONCILE_RESET
+    assert state.cid == "c2"
+    assert state.watermark == 0 and state.summary == "" and state.anchor == ""
+
+
+def test_reconcile_empty_contexts_resets_leftover_state():
+    # 收拢稳态（水位线 0 + 摘要在手）遇到历史清空必须整体作废，
+    # 否则陈旧摘要会注入一个全新的对话
+    state = SessionState(cid="c1", watermark=0, summary="s")
+    assert compress.reconcile(state, "c1", []) == compress.RECONCILE_RESET
+    assert state.summary == ""
+    clean = SessionState(cid="c1")
+    assert compress.reconcile(clean, "c1", []) == compress.RECONCILE_MATCH
+
+
+def test_reconcile_anchor_match_keeps_rolling():
+    contexts = _history()
+    state = SessionState(
+        cid="c1", watermark=3, summary="s", anchor=fingerprint(contexts[2])
+    )
+    assert compress.reconcile(state, "c1", contexts) == compress.RECONCILE_MATCH
+    assert state.watermark == 3 and state.summary == "s"
+
+
+def test_reconcile_collapse_adopts_when_summary_survives():
+    # 平台把压缩视图回存后历史变短、锚点越界：保留摘要、水位线归零
+    collapsed = _history(2)
+    state = SessionState(cid="c1", watermark=30, summary="s", anchor="gone")
+    assert compress.reconcile(state, "c1", collapsed) == compress.RECONCILE_COLLAPSED
+    assert state.watermark == 0 and state.anchor == "" and state.summary == "s"
+    # 收拢后的稳态此后一直视为匹配
+    assert compress.reconcile(state, "c1", collapsed) == compress.RECONCILE_MATCH
+
+
+def test_reconcile_in_range_anchor_mismatch_with_summary_collapses():
+    contexts = _history()
+    state = SessionState(cid="c1", watermark=3, summary="s", anchor="bogus")
+    assert compress.reconcile(state, "c1", contexts) == compress.RECONCILE_COLLAPSED
+    assert state.watermark == 0 and state.summary == "s"
+
+
+def test_reconcile_anchor_mismatch_without_summary_resets():
+    contexts = _history()
+    state = SessionState(cid="c1", watermark=3, anchor="bogus")
+    assert compress.reconcile(state, "c1", contexts) == compress.RECONCILE_RESET
+    assert state.watermark == 0 and state.anchor == ""
+
+
+# ---------------------------------------------------------------- 估算分项
+
+
+def test_last_parts_roundtrip():
+    state = SessionState(cid="c1", last_estimate=100)
+    state.last_parts = {"overhead": 60, "index": 10, "summary": 20, "history": 10}
+    restored = SessionState.from_dict(state.to_dict())
+    assert restored.last_parts == state.last_parts
+    assert restored == state
+
+
+def test_last_parts_tolerates_garbage():
+    raw = SessionState(cid="c1").to_dict()
+    raw["last_parts"] = {"overhead": "abc", "index": -5, "summary": 3, "extra": 9}
+    state = SessionState.from_dict(raw)
+    # 坏值归零、未知键忽略，但有效项保留
+    assert state.last_parts == {"overhead": 0, "index": 0, "summary": 3, "history": 0}
+    raw["last_parts"] = "not a dict"
+    assert SessionState.from_dict(raw).last_parts == {}
+
+
+def test_last_parts_missing_or_all_zero_stays_empty():
+    raw = SessionState(cid="c1").to_dict()
+    del raw["last_parts"]
+    assert SessionState.from_dict(raw).last_parts == {}
+    raw["last_parts"] = {"overhead": 0, "index": 0, "summary": 0, "history": 0}
+    assert SessionState.from_dict(raw).last_parts == {}

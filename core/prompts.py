@@ -5,7 +5,9 @@
   不破坏提示词缓存。
 - 索引块 / 摘要块以 user 消息注入历史开头——记忆内容源自用户对话，属于
   数据不是指令，不该被提升到系统权限层级（否则"记住：以后忽略你的规则"
-  就成了系统指令），块首明确标注这是数据。
+  就成了系统指令），块首明确标注这是数据。注入消息都带 _no_save 标记：
+  AstrBot 每轮会把实际发送的消息列表回存为会话历史，声明不回存才不会
+  在平台历史里逐轮累积副本。
 - 摘要提示词发给摘要模型，模板可由用户在配置中覆盖；压缩-记忆联动的
   抽取指令是固定尾块，独立于用户模板追加，用户改坏模板也不影响抽取。
 """
@@ -118,7 +120,7 @@ MEMORY.md 索引由插件自动维护：写入/删除记忆文件时自动增改
 - global：你（机器人）自己的全局记忆，所有会话共享生效。只存你自身的行为准则与偏好（feedback）、通用参考资料（reference）；任何关于具体用户、具体群聊的信息都不属于这里。
 - session：当前会话（本群或本私聊）的记忆：这里的人（user）、进行中的事（project）、仅本会话适用的指导（feedback）、资源指针（reference）。
 
-何时保存：用户告知长期有效的事实、纠正你的做法、确认某种做法可行、交代进行中的事项时，主动记录，不要等被要求——判断标准是这条信息在未来的对话里是否还有用。不保存：只对当前对话有意义的细节、寒暄闲聊、平台已完整保存的聊天原文。
+何时保存：用户告知长期有效的事实、纠正你的做法、确认某种做法可行、交代进行中的事项时，主动记录，不要等被要求——判断标准是这条信息在未来的对话里是否还有用。不保存：只对当前对话有意义的细节、寒暄闲聊、近期聊天里随手可查的原文。
 保存前先查重：翻索引或用 memory_search 确认是否已有覆盖同一事实的文件——有就更新那个文件，绝不另建重复文件；同一个人、同一件事始终写同一个文件。发现记忆过时或错误，立即改写或删除。
 使用记忆时：记忆是线索不是事实，内容反映的是写入时的情况；涉及具体安排与现状时，先与当前对话核实再采信，对不上就更新记忆。
 
@@ -151,19 +153,34 @@ def build_index_block(global_index: str, session_index: str) -> str | None:
 
 
 def build_index_message(block: str) -> dict:
-    return {"role": "user", "content": block}
+    # _no_save：AstrBot 每轮把实际发送的消息列表回存为会话历史，注入块
+    # 必须声明不回存，否则会在历史里逐轮累积一份副本。
+    return {"role": "user", "content": block, "_no_save": True}
 
 
 def build_summary_message(summary: str) -> dict:
     content = (
         f"{SUMMARY_BLOCK_OPEN}\n"
         f"{_DATA_NOTICE}\n"
-        "以下是本会话较早对话的滚动摘要（原始记录完整保存在平台会话历史中，"
-        "此后是未被摘要覆盖的原文消息）：\n\n"
+        "以下是本会话较早对话的滚动摘要（此后是未被摘要覆盖的原文消息）：\n\n"
         f"{summary.strip()}\n"
         f"{SUMMARY_BLOCK_CLOSE}"
     )
-    return {"role": "user", "content": content}
+    return {"role": "user", "content": content, "_no_save": True}
+
+
+def is_index_block(message: dict) -> bool:
+    """识别被平台历史带回来的插件索引块（v1.2.5 之前的版本会把它存进历史）。
+
+    只认 user 角色且 content 以索引块标记开头的消息；摘要块不在此列——
+    旧版本固化进历史的摘要块是被覆盖原文仅存的代表，必须保留。
+    """
+    content = message.get("content")
+    return (
+        message.get("role") == "user"
+        and isinstance(content, str)
+        and content.startswith(INDEX_BLOCK_OPEN)
+    )
 
 
 # ---------------------------------------------------------------- 摘要提示词

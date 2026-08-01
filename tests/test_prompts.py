@@ -193,3 +193,29 @@ def test_render_memory_file_frontmatter():
     assert "description: 项目截止日" in text
     assert "  type: project" in text
     assert text.endswith("2026-08-15 截止\n")
+
+
+def test_injected_messages_marked_no_save():
+    # AstrBot 会把发送的消息列表回存为会话历史，注入块必须声明不入史
+    assert prompts.build_index_message("x").get("_no_save") is True
+    assert prompts.build_summary_message("s").get("_no_save") is True
+
+
+def test_is_index_block():
+    block = build_index_block("- [a](a.md) — x", "")
+    assert prompts.is_index_block(prompts.build_index_message(block))
+    # 旧版本固化进历史的副本没有 _no_save 键，同样要认出来
+    assert prompts.is_index_block({"role": "user", "content": block})
+
+
+def test_is_index_block_rejects_non_index():
+    assert not prompts.is_index_block(build_summary_message("s"))
+    assert not prompts.is_index_block({"role": "user", "content": "普通消息"})
+    assert not prompts.is_index_block(
+        {"role": "assistant", "content": prompts.INDEX_BLOCK_OPEN + "\nx"}
+    )
+    assert not prompts.is_index_block(
+        {"role": "user", "content": "转述 " + prompts.INDEX_BLOCK_OPEN}
+    )
+    assert not prompts.is_index_block({"role": "user", "content": None})
+    assert not prompts.is_index_block({"role": "user"})

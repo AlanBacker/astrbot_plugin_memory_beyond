@@ -10,7 +10,9 @@
 @filter.llm_tool() 等公开插件接口，不 import AstrBot 内部实现、不 monkey-patch。
 压缩采用抢先策略：在钩子里把 req.contexts 压到低于内置压缩器 0.82 的阈值，
 内置压缩器的 should_compress() 因此永远为 False、自动退化为 no-op，
-同时留在下游当安全网。平台的会话历史永远一个字不动。
+同时留在下游当安全网。AstrBot 每轮会把实际发送的消息列表回存为会话历史，
+因此注入块一律带 _no_save 声明不入史；压缩后被摘要覆盖的原文会随回存从
+平台历史卸下，由持久化的摘要继续代表（详见 core/compress.py 模块注释）。
 """
 
 from __future__ import annotations
@@ -289,23 +291,36 @@ class MemoryBeyondPlugin(Star):
             return
         rt = await self._runtime(umo)
         state = rt.state
-        contexts = [m for m in (req.contexts or []) if isinstance(m, dict)]
+        # v1.2.5 之前注入的索引块会被 AstrBot 回存进平台历史，读入时清掉
+        # 这些副本（现在注入块带 _no_save 不再入史，此过滤兼作历史自愈）
+        contexts = [
+            m
+            for m in (req.contexts or [])
+            if isinstance(m, dict) and not prompts.is_index_block(m)
+        ]
 
-        # ---- 校验压缩状态仍锚定在当前对话与历史前缀上 ----
+        # ---- 状态与当前历史对齐：对话切换则作废，压缩被固化则重定位 ----
         cid = await self._conversation_id(event, req)
-        if not compress.state_matches(state, cid, contexts):
-            if state.summary:
+        had_summary = bool(state.summary)
+        outcome = compress.reconcile(state, cid, contexts)
+        if outcome == compress.RECONCILE_RESET:
+            if had_summary:
                 logger.info(
                     LOG_PREFIX
-                    + f"会话 {umo} 的历史与水位线不再匹配（对话切换或被重置），"
+                    + f"会话 {umo} 的历史与压缩状态不再匹配（对话切换或历史清空），"
                     "压缩状态作废重建"
                 )
-            state.cid = cid
-            state.reset_compression()
             await self._save_state(umo, state)
             # 对话已切换/重置，索引快照跟着作废，本轮从磁盘重读
             rt.index_block = None
             rt.index_loaded = False
+        elif outcome == compress.RECONCILE_COLLAPSED:
+            logger.info(
+                LOG_PREFIX
+                + f"会话 {umo} 的压缩视图已被平台回存固化，水位线重定位为 0"
+                "（摘要保留，当前历史整体视为摘要之后的尾部）"
+            )
+            await self._save_state(umo, state)
 
         # /reset 后 cid 不变、水位线为 0 时上面的校验不会触发：
         # 历史为空本身就说明是新对话，索引快照同样要刷新
@@ -336,8 +351,11 @@ class MemoryBeyondPlugin(Star):
             + len(getattr(req, "image_urls", None) or []) * tokens.IMAGE_TOKENS
             + TOOL_SCHEMA_ALLOWANCE
         )
-        if index_msg:
-            overhead += estimator.text(index_msg["content"]) + tokens.MESSAGE_OVERHEAD
+        index_cost = (
+            estimator.text(index_msg["content"]) + tokens.MESSAGE_OVERHEAD
+            if index_msg
+            else 0
+        )
 
         def current_tail() -> list[dict]:
             mark = max(state.watermark, n_system) if state.watermark else n_system
@@ -355,6 +373,7 @@ class MemoryBeyondPlugin(Star):
         if compress_on and window > 0:
             total = (
                 overhead
+                + index_cost
                 + estimator.text(state.summary)
                 + estimator.messages(tail)
             )
@@ -363,10 +382,12 @@ class MemoryBeyondPlugin(Star):
                 tail = current_tail()
 
             # 兜底：摘要后仍超预算（或摘要模型不可用）时，把本轮发送视图
-            # 裁进目标预算。只影响本轮，水位线与平台历史都不动。
+            # 裁进目标预算。水位线不动；被裁内容会随平台回存历史而丢失，
+            # 属于有损的最后手段。
             budget = (
                 int(window * self._target_ratio())
                 - overhead
+                - index_cost
                 - estimator.text(state.summary)
             )
             tail, clipped = compress.fit_tail_to_budget(
@@ -376,7 +397,7 @@ class MemoryBeyondPlugin(Star):
                 message = (
                     LOG_PREFIX
                     + f"会话 {umo} 本轮启用应急裁剪视图（摘要不可用或单轮过大），"
-                    "平台历史未受影响"
+                    "被裁内容可能随平台回存历史而丢失"
                 )
                 if rt.warned_clip:
                     logger.debug(message)
@@ -396,11 +417,16 @@ class MemoryBeyondPlugin(Star):
         if guidance and guidance not in str(req.system_prompt or ""):
             req.system_prompt = str(req.system_prompt or "") + guidance
 
-        state.last_estimate = (
-            overhead
-            + estimator.text(state.summary)
-            + estimator.messages(tail)
-        )
+        summary_cost = estimator.text(state.summary)
+        tail_cost = estimator.messages(tail)
+        state.last_estimate = overhead + index_cost + summary_cost + tail_cost
+        # 分项构成随估算落盘，mb_status 用它解释数值由什么组成
+        state.last_parts = {
+            "overhead": overhead,
+            "index": index_cost,
+            "summary": summary_cost,
+            "history": tail_cost,
+        }
         rt.awaiting_calibration = True
         # 估算值随状态落盘，重启/重载插件后 mb_status 仍能给出上一次的统计
         await self._save_state(umo, state)
@@ -505,7 +531,7 @@ class MemoryBeyondPlugin(Star):
                     LOG_PREFIX
                     + f"会话 {umo} 摘要生成失败（{'; '.join(attempts_log) or '无可用提供商'}），"
                     f"已连续失败 {state.fail_count} 次，进入退避冷却；"
-                    "冷却期内使用应急裁剪视图，历史无损，冷却后自动重试"
+                    "冷却期内启用应急裁剪视图（有损兜底），冷却后自动重试"
                 )
             return
 
@@ -835,10 +861,13 @@ class MemoryBeyondPlugin(Star):
 
     # ============================================================ 管理指令
 
-    async def _estimate_live(self, event: AstrMessageEvent, rt: RuntimeSession) -> int:
+    async def _estimate_live(
+        self, event: AstrMessageEvent, rt: RuntimeSession
+    ) -> tuple[int, dict]:
         """无估算记录时（如旧版本升级来的会话），从平台存储的历史现场估算。
 
-        拿不到请求现场的人格提示词与本轮输入，结果略低于请求路径的口径。
+        返回 (总量, 分项构成)。拿不到请求现场的人格提示词与本轮输入，
+        结果略低于请求路径的口径。
         """
         state = rt.state
         try:
@@ -846,18 +875,23 @@ class MemoryBeyondPlugin(Star):
             mgr = self.context.conversation_manager
             cid = await mgr.get_curr_conversation_id(umo)
             if not cid:
-                return 0
+                return 0, {}
             conversation = await mgr.get_conversation(umo, str(cid))
             raw = getattr(conversation, "history", "") or "[]"
             data = json.loads(raw) if isinstance(raw, str) else raw
             if not isinstance(data, list):
-                return 0
-            contexts = [m for m in data if isinstance(m, dict)]
+                return 0, {}
+            # 与请求路径同口径：剔除旧版本固化进历史的索引块副本
+            contexts = [
+                m
+                for m in data
+                if isinstance(m, dict) and not prompts.is_index_block(m)
+            ]
         except Exception:  # noqa: BLE001
             logger.debug(LOG_PREFIX + "现场估算读取历史失败", exc_info=True)
-            return 0
+            return 0, {}
         if not contexts:
-            return 0
+            return 0, {}
         memory_on = self._bool("enable_memory", True)
         estimator = tokens.TokenEstimator(state.ratio)
         n_system = split_leading_system(contexts)
@@ -865,19 +899,25 @@ class MemoryBeyondPlugin(Star):
             mark = max(state.watermark, n_system)
         else:
             mark = n_system
-        total = (
-            estimator.messages(contexts[:n_system])
-            + estimator.text(prompts.MEMORY_GUIDANCE if memory_on else "")
-            + TOOL_SCHEMA_ALLOWANCE
-            + estimator.text(state.summary)
-            + estimator.messages(contexts[mark:])
-        )
+        index_cost = 0
         if memory_on:
             block = await self._index_block(rt, event)
             if block:
                 index_msg = prompts.build_index_message(block)
-                total += estimator.text(index_msg["content"]) + tokens.MESSAGE_OVERHEAD
-        return total
+                index_cost = (
+                    estimator.text(index_msg["content"]) + tokens.MESSAGE_OVERHEAD
+                )
+        parts = {
+            "overhead": (
+                estimator.messages(contexts[:n_system])
+                + estimator.text(prompts.MEMORY_GUIDANCE if memory_on else "")
+                + TOOL_SCHEMA_ALLOWANCE
+            ),
+            "index": index_cost,
+            "summary": estimator.text(state.summary),
+            "history": estimator.messages(contexts[mark:]),
+        }
+        return sum(parts.values()), parts
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("mb_status")
@@ -902,17 +942,28 @@ class MemoryBeyondPlugin(Star):
                 f"最近一次请求估算：{state.last_estimate} tokens"
                 f"（校准比例 {state.ratio:.2f}）"
             )
+            parts = state.last_parts
         else:
-            live = await self._estimate_live(event, rt)
+            live, live_parts = await self._estimate_live(event, rt)
             if live > 0:
                 estimate_line = (
                     f"当前上下文现场估算：{live} tokens"
                     f"（校准比例 {state.ratio:.2f}，未含人格提示词与本轮输入）"
                 )
+                parts = live_parts
             else:
                 estimate_line = (
                     f"最近一次请求估算：0 tokens（校准比例 {state.ratio:.2f}）"
                 )
+                parts = {}
+        estimate_lines = [estimate_line]
+        if parts:
+            estimate_lines.append(
+                f"　构成：固定开销 {parts.get('overhead', 0)}"
+                f" + 记忆索引 {parts.get('index', 0)}"
+                f" + 摘要 {parts.get('summary', 0)}"
+                f" + 历史原文 {parts.get('history', 0)}"
+            )
         lines = [
             "Memory Beyond 状态",
             f"记忆：{'启用' if self._bool('enable_memory', True) else '停用'}"
@@ -921,7 +972,7 @@ class MemoryBeyondPlugin(Star):
             f"上下文窗口：{window if window > 0 else '未知'}（{window_note}）",
             f"触发阈值：{self._threshold()}，压缩目标：{self._target_ratio()}",
             f"水位线：{state.watermark}，摘要：{len(state.summary)} 字",
-            estimate_line,
+            *estimate_lines,
             "最近一次缓存命中："
             + (
                 f"{state.cache_hit_tokens} tokens"
@@ -945,8 +996,9 @@ class MemoryBeyondPlugin(Star):
         rt.index_loaded = False
         await self._save_state(umo, rt.state)
         yield event.plain_result(
-            "已清空本会话的压缩状态（摘要与水位线）。平台历史完整保留，"
-            "上下文超过阈值时会重新滚动摘要。"
+            "已清空本会话的压缩状态（摘要与水位线）。注意：此前已被压缩"
+            "卸下的旧对话不会自动回来；之后超过阈值时会基于当前历史重新"
+            "滚动摘要。"
         )
 
     @filter.permission_type(filter.PermissionType.ADMIN)

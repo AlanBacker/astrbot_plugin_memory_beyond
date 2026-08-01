@@ -1,17 +1,23 @@
 """上下文压缩状态机：摘要 + 水位线。
 
-丢弃旧上下文只发生在发送给模型的派生视图里，平台的会话历史一个字不动。
 插件为每个会话维护「摘要 + 水位线（已摘要覆盖到第几条消息）」，每轮拼出
     发送视图 = 开头 system 消息 + 摘要块 + 水位线之后的原文消息
 再次压缩时做滚动摘要：上一份摘要和其后的旧轮次一起重摘要，推进水位线。
 
-水位线用消息下标表示。req.contexts 每轮从会话历史重建、前缀稳定，下标
-因此可复用；为防会话被重置/编辑导致下标错位，状态里记录水位线前一条消息
-的指纹，对不上就整体作废重来（代价只是重新摘要一次，不会丢数据）。
+平台侧的关键事实：AstrBot 每轮会把实际发送的消息列表回存为会话历史
+（整体替换）。压缩一旦发生，被摘要覆盖的原文就会随下一次回存从平台历史
+卸下，此后由摘要（存于插件状态、每轮以 _no_save 消息注入）继续代表。
 
-摘要 LLM 不可用时的兜底（不产生任何永久信息损失）：本轮直接用
-「已有摘要 + 对半砍旧轮次」拼出应急视图，水位线不动；进入指数退避冷却，
-冷却结束后的请求再重试 LLM 摘要，被砍掉的轮次那时会正常滚入摘要。
+水位线用消息下标表示，状态里记录水位线前一条消息的指纹，每轮由
+reconcile() 校验状态与当前历史是否仍对得上：
+- 锚点吻合——平台侧仍保留着原文（未发生回存固化），按下标继续滚动；
+- 锚点找不到但摘要在手——判定为压缩视图已被平台回存固化，把水位线归零、
+  保留摘要，此后整份历史都视为摘要之后的尾部；
+- 对话切换或历史被清空——状态整体作废重来。
+
+摘要 LLM 不可用时的兜底：本轮用「已有摘要 + 对半砍旧轮次」拼出应急裁剪
+视图并进入指数退避冷却（冷却结束自动重试）。在会回存历史的 AstrBot 上
+裁剪结果同样会被固化，属于有损的最后手段，仅在摘要不可用且超预算时启用。
 """
 
 from __future__ import annotations
@@ -55,6 +61,10 @@ class SessionState:
     ratio: float = 1.0
     # 最近一次请求的 token 估算值。
     last_estimate: int = 0
+    # 最近一次估算的分项构成：overhead（固定开销）/ index（索引块）/
+    # summary（摘要）/ history（历史原文），四项之和即 last_estimate；
+    # 空字典表示尚无记录（如旧版本升级来的状态文件）。
+    last_parts: dict = field(default_factory=dict)
     # 最近一次请求命中提示词缓存的 token 数；-1 表示提供商未上报。
     cache_hit_tokens: int = -1
     fail_count: int = 0
@@ -69,6 +79,7 @@ class SessionState:
             "anchor": self.anchor,
             "ratio": self.ratio,
             "last_estimate": self.last_estimate,
+            "last_parts": dict(self.last_parts),
             "cache_hit_tokens": self.cache_hit_tokens,
             "fail_count": self.fail_count,
             "fail_until": self.fail_until,
@@ -95,6 +106,17 @@ class SessionState:
             return cls(cid=state.cid, summary=state.summary, anchor=state.anchor)
         if not math.isfinite(state.ratio) or state.ratio <= 0:
             state.ratio = 1.0
+        raw_parts = raw.get("last_parts")
+        if isinstance(raw_parts, dict):
+            parts: dict = {}
+            for key in ("overhead", "index", "summary", "history"):
+                try:
+                    parts[key] = max(0, int(raw_parts.get(key, 0)))
+                except (TypeError, ValueError):
+                    parts[key] = 0
+            # 全零视同没有记录（正常记录 overhead 恒为正）
+            if any(parts.values()):
+                state.last_parts = parts
         return state
 
     def reset_compression(self) -> None:
@@ -150,6 +172,43 @@ def state_matches(state: SessionState, cid: str, contexts: list[dict]) -> bool:
         return False
     anchor_msg = contexts[state.watermark - 1]
     return isinstance(anchor_msg, dict) and fingerprint(anchor_msg) == state.anchor
+
+
+RECONCILE_MATCH = "match"
+RECONCILE_COLLAPSED = "collapsed"
+RECONCILE_RESET = "reset"
+
+
+def reconcile(state: SessionState, cid: str, contexts: list[dict]) -> str:
+    """把压缩状态与当前历史对齐（就地修改 state），返回所做的处理。
+
+    - RECONCILE_MATCH：状态适用，无需变动；
+    - RECONCILE_COLLAPSED：水位线锚点找不到了但摘要在手，判定为压缩视图
+      已被平台回存固化——水位线归零、摘要保留，整份历史此后视为尾部；
+      平台不回存时锚点每轮都能对上，永远不会走到这一支；
+    - RECONCILE_RESET：对话切换或历史被清空，压缩状态作废（cid 重新锚定）。
+    """
+    if state.cid != cid:
+        state.cid = cid
+        state.reset_compression()
+        return RECONCILE_RESET
+    if not contexts:
+        if state.watermark or state.summary or state.anchor:
+            state.reset_compression()
+            return RECONCILE_RESET
+        return RECONCILE_MATCH
+    if state.watermark <= 0:
+        return RECONCILE_MATCH
+    if state.watermark <= len(contexts):
+        anchor_msg = contexts[state.watermark - 1]
+        if isinstance(anchor_msg, dict) and fingerprint(anchor_msg) == state.anchor:
+            return RECONCILE_MATCH
+    if state.summary:
+        state.watermark = 0
+        state.anchor = ""
+        return RECONCILE_COLLAPSED
+    state.reset_compression()
+    return RECONCILE_RESET
 
 
 def validate_threshold(raw: float) -> tuple[float, str]:
@@ -268,7 +327,8 @@ def fit_tail_to_budget(
 ) -> tuple[list[dict], bool]:
     """把水位线之后的原文消息压进预算：反复对半砍旧轮次，仍超则裁剪 content。
 
-    只作用于本轮发送视图，水位线与磁盘状态都不动，信息不会永久丢失。
+    只作用于本轮发送视图，水位线与磁盘状态都不动；在会把发送视图回存为
+    历史的平台上，被裁内容会随回存固化丢失（有损兜底，仅摘要不可用时启用）。
     返回 (裁剪后的消息列表, 是否发生了裁剪)。
     """
     if estimator.messages(tail) <= budget:
