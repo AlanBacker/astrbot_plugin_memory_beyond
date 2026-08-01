@@ -5,6 +5,12 @@
     "hint": "注入记忆索引并向 LLM 提供 memory_read / memory_write / memory_search 工具。关闭后已存记忆保留在磁盘，仅停止注入与读写。",
     "default": true
   },
+  "enable_global_memory": {
+    "description": "启用全局记忆（跨会话共享的机器人自我记忆）",
+    "type": "bool",
+    "hint": "全局记忆存机器人自身的行为准则与偏好，写入后对所有群聊和私聊生效。默认关闭：机器人只读写当前会话的记忆，任何会话都影响不到它在其他会话的表现。开启前请想清楚：任何会话里的对话都可能促使机器人写入全局记忆，从而改变它在全部会话中的行为。关闭后已有的全局记忆文件保留在磁盘，仅停止注入与读写。",
+    "default": false
+  },
   "annotate_sender": {
     "description": "在用户消息前标注发送者身份",
     "type": "bool",

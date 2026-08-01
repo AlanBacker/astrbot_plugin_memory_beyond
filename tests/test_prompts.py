@@ -31,6 +31,28 @@ def test_index_block_contains_scopes_and_tags():
     assert "（暂无）" in block  # 空的会话作用域
 
 
+def test_index_block_global_disabled():
+    # global_index 传 None＝全局记忆停用：块内不出现全局段
+    block = build_index_block(None, "- [b](b.md) — y")
+    assert "全局记忆索引" not in block
+    assert "会话记忆索引" in block and "- [b](b.md) — y" in block
+    # 仅剩的会话作用域也没内容时不注入
+    assert build_index_block(None, "  \n ") is None
+
+
+def test_memory_guidance_scope_variants():
+    full = prompts.memory_guidance(True)
+    assert "两个作用域" in full and "- global：" in full
+    assert "global 绝不存放关于具体用户或群的信息" in full
+    session_only = prompts.memory_guidance(False)
+    assert "两个作用域" not in session_only
+    assert "scope 一律填 session" in session_only
+    assert "global 绝不存放" not in session_only
+    # 作用域段之外的规范两个版本逐字一致
+    assert session_only[:600] == full[:600]
+    assert "记人规范（必须遵守）" in session_only
+
+
 def test_summary_message_is_data_not_instruction():
     message = build_summary_message("摘要正文")
     assert message["role"] == "user"

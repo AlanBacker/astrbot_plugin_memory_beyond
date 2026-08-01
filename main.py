@@ -44,6 +44,9 @@ FALLBACK_ATTEMPTS = 2
 TOOL_SCHEMA_ALLOWANCE = 800
 # 应急裁剪时留给正文消息的最小预算。
 MIN_TAIL_BUDGET = 1000
+# 全局记忆关闭时对 scope=global 工具调用的固定回执；工具说明是静态的
+# 仍会列出 global，回执要把模型引导回 session。
+GLOBAL_MEMORY_OFF = "全局记忆已在插件配置中停用；请改用 session 作用域。"
 # 会话运行时缓存上限（LRU 淘汰，仅内存快照，磁盘状态不受影响）。
 MAX_RUNTIME_SESSIONS = 256
 
@@ -104,6 +107,8 @@ class RuntimeSession:
     state: compress.SessionState
     index_block: str | None = None
     index_loaded: bool = False
+    # 快照构建时的全局记忆开关；配置热改后据此判定快照失效
+    index_global_on: bool = False
     awaiting_calibration: bool = False
     warned_window: bool = False
     warned_summarizer: bool = False
@@ -273,6 +278,11 @@ class MemoryBeyondPlugin(Star):
             return qq_name, group_card, is_group
         return None, None, is_group
 
+    def _global_on(self) -> bool:
+        """全局记忆开关，默认关闭。关闭时不注入全局索引、拒绝全局读写，
+        机器人只使用当前会话的记忆；磁盘上已有的全局文件原样保留。"""
+        return self._bool("enable_global_memory", False)
+
     def _global_scope(self) -> memstore.ScopeStore:
         """机器人自我的全局记忆，所有会话共享一个目录。"""
         return self._store.global_scope()
@@ -359,7 +369,7 @@ class MemoryBeyondPlugin(Star):
             if block:
                 index_msg = prompts.build_index_message(block)
 
-        guidance = prompts.MEMORY_GUIDANCE if memory_on else ""
+        guidance = prompts.memory_guidance(self._global_on()) if memory_on else ""
         estimator = tokens.TokenEstimator(state.ratio)
 
         n_system = split_leading_system(contexts)
@@ -504,12 +514,16 @@ class MemoryBeyondPlugin(Star):
     async def _index_block(
         self, rt: RuntimeSession, event: AstrMessageEvent
     ) -> str | None:
-        if rt.index_loaded:
+        global_on = self._global_on()
+        if rt.index_loaded and rt.index_global_on == global_on:
             return rt.index_block
-        global_snap = await self._global_scope().load_index()
+        global_index = None
+        if global_on:
+            global_index = (await self._global_scope().load_index()).text
         session_snap = await self._session_scope(event).load_index()
-        rt.index_block = prompts.build_index_block(global_snap.text, session_snap.text)
+        rt.index_block = prompts.build_index_block(global_index, session_snap.text)
         rt.index_loaded = True
+        rt.index_global_on = global_on
         return rt.index_block
 
     # ============================================================ 压缩执行
@@ -810,6 +824,9 @@ class MemoryBeyondPlugin(Star):
         """
         if not self._bool("enable_memory", True):
             return "记忆功能已在插件配置中停用。"
+        scope = (scope or "").strip().lower()
+        if scope == "global" and not self._global_on():
+            return GLOBAL_MEMORY_OFF
         store = self._scope_for(event, scope)
         if store is None:
             return "scope 参数必须是 global 或 session。"
@@ -840,6 +857,8 @@ class MemoryBeyondPlugin(Star):
         if not self._bool("enable_memory", True):
             return "记忆功能已在插件配置中停用。"
         scope = (scope or "").strip().lower()
+        if scope == "global" and not self._global_on():
+            return GLOBAL_MEMORY_OFF
         store = self._scope_for(event, scope)
         if store is None:
             return "scope 参数必须是 global 或 session。"
@@ -871,8 +890,12 @@ class MemoryBeyondPlugin(Star):
         if not query:
             return "query 不能为空。"
         scope = (scope or "all").strip().lower()
+        global_on = self._global_on()
+        if scope == "global" and not global_on:
+            return GLOBAL_MEMORY_OFF
         stores: list[tuple[str, memstore.ScopeStore]] = []
-        if scope in ("global", "all"):
+        # 关闭全局时 scope=all 静默降级为只搜会话
+        if scope in ("global", "all") and global_on:
             stores.append(("global", self._global_scope()))
         if scope in ("session", "all"):
             stores.append(("session", self._session_scope(event)))
@@ -947,7 +970,9 @@ class MemoryBeyondPlugin(Star):
         parts = {
             "overhead": (
                 estimator.messages(contexts[:n_system])
-                + estimator.text(prompts.MEMORY_GUIDANCE if memory_on else "")
+                + estimator.text(
+                    prompts.memory_guidance(self._global_on()) if memory_on else ""
+                )
             ),
             "tools": tools_cost,
             "index": index_cost,
@@ -968,7 +993,12 @@ class MemoryBeyondPlugin(Star):
         rt = await self._runtime(umo)
         state = rt.state
         window, window_note = await self._resolve_window(event)
-        global_files = self._global_scope().list_files()
+        global_on = self._global_on()
+        global_part = (
+            f"全局 {len(self._global_scope().list_files())} 个文件"
+            if global_on
+            else "全局 停用"
+        )
         session_files = self._session_scope(event).list_files()
         configured_id = self._str("summary_provider_id").strip() or "（未配置，用当前对话提供商）"
 
@@ -1014,7 +1044,7 @@ class MemoryBeyondPlugin(Star):
         lines = [
             "Memory Beyond 状态",
             f"记忆：{'启用' if self._bool('enable_memory', True) else '停用'}"
-            f"（全局 {len(global_files)} 个文件 / 会话 {len(session_files)} 个文件）",
+            f"（{global_part} / 会话 {len(session_files)} 个文件）",
             f"压缩：{'启用' if self._bool('enable_compression', True) else '停用'}",
             f"上下文窗口：{window if window > 0 else '未知'}（{window_note}）",
             f"触发阈值：{self._threshold()}，压缩目标：{self._target_ratio()}",
