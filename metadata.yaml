@@ -1,9 +1,9 @@
 name: astrbot_plugin_memory_beyond
-desc: 给机器人加上长期记忆：值得记住的人和事写进本地 Markdown 文件，换对话、重启都不忘；聊天过长时自动把旧内容压缩成摘要，不爆 token，平台聊天记录保持原样。
+desc: 使用索引式档案存储的方案，为你的聊天机器人加上更好的记忆系统，无需Embedding模型；自带上下文压缩方案，使用前请阅读Readme！
 help: 装上即用。机器人会自己调用 memory_read / memory_write / memory_search 工具读写记忆；上下文快满时自动摘要压缩。建议在插件配置中填写 max_context_tokens（模型上下文窗口大小），并按 README 调整 AstrBot 的两处内置设置。管理员指令：/mb_status 查看状态，/mb_reset 重置本会话压缩状态，/mb_probe 测试摘要链路。
 version: v1.2.0
 author: AlanBacker
 repo: "https://github.com/AlanBacker/astrbot_plugin_memory_beyond"
 display_name: Memory Beyond
-short_desc: 让机器人记住人和事，聊再久也不失忆。
+short_desc: 用更好的方案让机器人记住人和事，聊再久也不失忆。
 astrbot_version: ">=4.5.7"
