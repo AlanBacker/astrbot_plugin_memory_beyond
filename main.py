@@ -110,6 +110,9 @@ class RuntimeSession:
     # 快照构建时的全局记忆开关；配置热改后据此判定快照失效
     index_global_on: bool = False
     awaiting_calibration: bool = False
+    # 上一轮的 usage 样本待消费：校准延迟到下一轮请求开头，那时才能从
+    # 回存的历史里看出上一轮是否走了工具循环（那样的样本不能学）
+    pending_calibration: bool = False
     warned_window: bool = False
     warned_summarizer: bool = False
     warned_clip: bool = False
@@ -328,6 +331,23 @@ class MemoryBeyondPlugin(Star):
             if isinstance(m, dict) and not prompts.is_index_block(m)
         ]
 
+        # ---- 消费上一轮的用量校准样本 ----
+        # 估算只覆盖一轮的首次调用，而 usage 来自最后一次调用：上一轮若走
+        # 了工具循环，最后一次调用会多出中途塞入的工具结果，这种样本会把
+        # 比例系统性推高。工具痕迹要等历史回存后才能看到，所以校准延迟到
+        # 这里；比例仍在本轮估算之前更新完毕，生效时机与原来一致。
+        if rt.pending_calibration:
+            rt.pending_calibration = False
+            if compress.last_round_used_tools(contexts):
+                logger.debug(
+                    LOG_PREFIX
+                    + f"会话 {umo} 上一轮走了工具循环，usage 样本不用于校准"
+                )
+            elif state.last_estimate > 0 and state.last_actual > 0:
+                calibrator = tokens.TokenEstimator(state.ratio)
+                calibrator.calibrate(state.last_estimate, state.last_actual)
+                state.ratio = calibrator.ratio
+
         # ---- 状态与当前历史对齐：对话切换则作废，压缩被固化则重定位 ----
         cid = await self._conversation_id(event, req)
         had_summary = bool(state.summary)
@@ -398,30 +418,38 @@ class MemoryBeyondPlugin(Star):
         tail = current_tail()
         clipped = False
         if compress_on and window > 0:
-            total = (
-                overhead
-                + tools_cost
-                + index_cost
-                + estimator.text(state.summary)
-                + estimator.messages(tail)
-            )
-            if total > int(window * self._threshold()):
+            threshold_tokens = int(window * self._threshold())
+
+            def total_now() -> int:
+                return (
+                    overhead
+                    + tools_cost
+                    + index_cost
+                    + estimator.text(state.summary)
+                    + estimator.messages(tail)
+                )
+
+            total = total_now()
+            if total > threshold_tokens:
                 await self._compress(event, rt, umo, contexts, total)
                 tail = current_tail()
+                total = total_now()
 
-            # 兜底：摘要后仍超预算（或摘要模型不可用）时，把本轮发送视图
-            # 裁进目标预算。水位线不动；被裁内容会随平台回存历史而丢失，
-            # 属于有损的最后手段。
-            budget = (
-                int(window * self._target_ratio())
-                - overhead
-                - tools_cost
-                - index_cost
-                - estimator.text(state.summary)
-            )
-            tail, clipped = compress.fit_tail_to_budget(
-                tail, estimator, max(budget, MIN_TAIL_BUDGET)
-            )
+            # 兜底裁剪只在压缩尝试之后仍超阈值时接管（摘要失败、冷却期、
+            # 单轮过大）。它的目标水位低于触发阈值，若每轮无条件执行，
+            # 会把总量永远摁在触发线之下，滚动摘要一次也轮不到。
+            # 水位线不动；被裁内容会随平台回存历史而丢失，属有损最后手段。
+            if total > threshold_tokens:
+                budget = (
+                    int(window * self._target_ratio())
+                    - overhead
+                    - tools_cost
+                    - index_cost
+                    - estimator.text(state.summary)
+                )
+                tail, clipped = compress.fit_tail_to_budget(
+                    tail, estimator, max(budget, MIN_TAIL_BUDGET)
+                )
             if clipped:
                 message = (
                     LOG_PREFIX
@@ -540,9 +568,12 @@ class MemoryBeyondPlugin(Star):
         now = time.time()
         if state.in_cooldown(now):
             return
-        plan = compress.plan_compression(
-            contexts, state.watermark, self._int("keep_recent_turns", 3)
-        )
+        keep = self._int("keep_recent_turns", 3)
+        plan = compress.plan_compression(contexts, state.watermark, keep)
+        if plan is None and keep > 1:
+            # 历史凑不满配置的保留轮数时，降为只保最新一轮再试——直接放弃
+            # 的话下游只剩有损裁剪，能卷进摘要的旧轮不该白白被裁掉
+            plan = compress.plan_compression(contexts, state.watermark, 1)
         if plan is None:
             return
         transcript = compress.render_transcript(plan.to_summarize)
@@ -755,7 +786,7 @@ class MemoryBeyondPlugin(Star):
 
     @filter.on_llm_response()
     async def calibrate_tokens(self, event: AstrMessageEvent, resp: LLMResponse):
-        """provider 返回真实用量时，用真实值校准估算比例（优先用真实值）。"""
+        """provider 返回真实用量时记录样本，校准延迟到下一轮请求时消费。"""
         try:
             umo = str(getattr(event, "unified_msg_origin", ""))
             rt = self._sessions.get(umo)
@@ -792,20 +823,15 @@ class MemoryBeyondPlugin(Star):
             if actual <= 0:
                 return
             state = rt.state
-            old_ratio = state.ratio
             old_cache_hit = state.cache_hit_tokens
-            estimator = tokens.TokenEstimator(state.ratio)
-            estimator.calibrate(state.last_estimate, actual)
-            state.ratio = estimator.ratio
-            # 真实上报值记下来，mb_status 里与估算并排展示可直接对照
+            # 真实上报值记下来，mb_status 里与估算并排展示可直接对照。
+            # 比例不在这里学：本轮是否走了工具循环要等历史回存后才能判断，
+            # 样本留到下一轮请求开头消费（compress.last_round_used_tools）。
             state.last_actual = actual
             state.cache_hit_tokens = -1 if cache_hit is None else cache_hit
-            # 校准结果落盘，重启后不回退；比例漂移小且缓存命中数没变时跳过，
-            # 避免收敛后每轮响应都写盘。
-            if (
-                abs(state.ratio - old_ratio) > 0.005
-                or state.cache_hit_tokens != old_cache_hit
-            ):
+            rt.pending_calibration = True
+            # 缓存命中数变化时落盘；比例更新随下一轮请求末尾的常规落盘。
+            if state.cache_hit_tokens != old_cache_hit:
                 await self._save_state(umo, state)
         except Exception:  # noqa: BLE001
             logger.debug(LOG_PREFIX + "token 校准失败", exc_info=True)
@@ -1041,6 +1067,14 @@ class MemoryBeyondPlugin(Star):
                 f"最近一次实际上报：{state.last_actual} tokens"
                 "（提供商 usage，估算校准以它为准）"
             )
+        if window > 0 and parts:
+            fixed_floor = parts.get("overhead", 0) + parts.get("tools", 0)
+            if fixed_floor >= int(window * self._target_ratio()):
+                estimate_lines.append(
+                    "⚠️ 人格提示词与工具声明的固定开销已不低于压缩目标水位，"
+                    "摘要腾不出空间，只能反复有损裁剪历史——"
+                    "请调大 max_context_tokens，或减少启用的插件工具"
+                )
         lines = [
             "Memory Beyond 状态",
             f"记忆：{'启用' if self._bool('enable_memory', True) else '停用'}"

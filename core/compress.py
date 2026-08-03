@@ -353,6 +353,23 @@ def fit_tail_to_budget(
     return kept, True
 
 
+def last_round_used_tools(contexts: list[dict]) -> bool:
+    """判断回存历史里最近一轮（最后一条 user 之后）是否走了工具循环。
+
+    token 估算只覆盖一轮的首次调用，而 usage 来自最后一次调用；工具循环
+    会在两者之间塞入工具结果，这样的 usage 样本不能拿来校准估算比例。
+    """
+    for message in reversed(contexts):
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        if role == "user":
+            return False
+        if role == "tool" or message.get("tool_calls"):
+            return True
+    return False
+
+
 # ---------------------------------------------------------------- 转写渲染
 
 

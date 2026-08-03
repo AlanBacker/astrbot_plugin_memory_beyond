@@ -328,3 +328,47 @@ def test_last_parts_missing_or_all_zero_stays_empty():
 def test_last_actual_clamped():
     assert SessionState.from_dict({"last_actual": -3}).last_actual == 0
     assert SessionState.from_dict({}).last_actual == 0
+
+
+# ---------------------------------------------------------------- 校准取样
+
+
+def test_last_round_used_tools_clean_round():
+    assert compress.last_round_used_tools([]) is False
+    assert compress.last_round_used_tools(_history(2)) is False
+
+
+def test_last_round_used_tools_detects_tool_round():
+    contexts = _history(1) + [
+        {"role": "user", "content": "查天气"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "t1"}]},
+        {"role": "tool", "content": "晴"},
+        {"role": "assistant", "content": "今天晴"},
+    ]
+    assert compress.last_round_used_tools(contexts) is True
+    # 只剩 tool_calls、工具结果尚未回存时同样识别
+    assert compress.last_round_used_tools(contexts[:-2]) is True
+
+
+def test_last_round_used_tools_only_checks_last_round():
+    # 更早轮次用过工具、最近一轮没用：样本干净，可用于校准
+    contexts = _history(1) + [
+        {"role": "user", "content": "查天气"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "t1"}]},
+        {"role": "tool", "content": "晴"},
+        {"role": "assistant", "content": "今天晴"},
+        {"role": "user", "content": "谢谢"},
+        {"role": "assistant", "content": "不客气"},
+    ]
+    assert compress.last_round_used_tools(contexts) is False
+    assert compress.last_round_used_tools(contexts + ["garbage"]) is False
+
+
+def test_plan_compression_keep_one_when_history_short():
+    # 只有两轮时 keep=3 选不出旧轮，降为 keep=1 应能把第一轮卷入摘要
+    contexts = _history(2)
+    assert plan_compression(contexts, watermark=0, keep_recent_turns=3) is None
+    plan = plan_compression(contexts, watermark=0, keep_recent_turns=1)
+    assert plan is not None
+    assert plan.new_watermark == 3  # 最后一轮 user 的下标
+    assert [m["content"] for m in plan.to_summarize] == ["persona", "q0", "a0"]
