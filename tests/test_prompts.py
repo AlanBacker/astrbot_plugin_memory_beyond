@@ -137,6 +137,33 @@ def test_build_summary_prompt_empty_previous():
     assert "（无）" in prompt
 
 
+def test_build_summary_prompt_bad_template_syntax_falls_back():
+    # 属性 / 键 / 转换写法在模板里都走不通，整体退回默认模板而不是抛异常
+    for template in ("x {transcript.text}", "x {transcript[k]}", "x {transcript!z}"):
+        prompt = build_summary_prompt(template, "prev", "对话转写", extract_memories=False)
+        assert "对话转写" in prompt and not prompt.startswith("x ")
+
+
+def test_sender_ids_in_reads_last_segment_only():
+    text = (
+        f"{SENDER_TAG_PREFIX}QQ名 QQ号 999999｜QQ号 111111] 大家好\n"
+        f"{SENDER_TAG_PREFIX}名称 DavID 5｜ID 222222] 在\n"
+        f"{SENDER_TAG_PREFIX}名称 小明｜ID webchat!user] 嗯"
+    )
+    assert prompts.sender_ids_in(text) == ["111111", "222222"]
+
+
+def test_parse_memories_keeps_long_merged_body():
+    body = "长" * 3010
+    drafts = prompts.parse_memories(
+        json.dumps(
+            [{"type": "user", "name": "user-1", "description": "d", "content": body}],
+            ensure_ascii=False,
+        )
+    )
+    assert len(drafts) == 1 and len(drafts[0].content) == 3010
+
+
 # ---------------------------------------------------------------- 响应解析
 
 
@@ -149,7 +176,8 @@ def test_parse_summary_with_tags_and_memories():
             "description": "群友",
             "content": "QQ 12345678 喜欢简洁回复（昵称：小明）",
         },
-        {"type": "reference", "name": "not-allowed", "description": "d", "content": "c"},
+        {"type": "reference", "name": "group-rules", "description": "d", "content": "c"},
+        {"type": "secret", "name": "not-allowed", "description": "d", "content": "c"},
         {"type": "feedback", "name": "", "description": "d", "content": "c"},
     ]
     text = (
@@ -158,11 +186,12 @@ def test_parse_summary_with_tags_and_memories():
     )
     summary, drafts = parse_summary_response(text)
     assert summary == "## 结论\n压缩摘要"
-    assert len(drafts) == 2  # reference 类型与空 name 被过滤
+    assert len(drafts) == 3  # 未知类型与空 name 被过滤
     assert drafts[0].name == "my-deadline"  # slug 归一化
     assert drafts[0].filename == "my-deadline.md"
     assert drafts[1].type == "user"
     assert drafts[1].filename == "user-12345678.md"  # 数字 ID 锚定
+    assert drafts[2].type == "reference"
 
 
 def test_parse_summary_without_tags_falls_back():
@@ -241,3 +270,61 @@ def test_is_index_block_rejects_non_index():
     )
     assert not prompts.is_index_block({"role": "user", "content": None})
     assert not prompts.is_index_block({"role": "user"})
+
+
+# ---------------------------------------------------------------- 提取辅助
+
+
+def test_sender_ids_in_reads_all_tag_styles():
+    transcript = (
+        "[发送者：群名片 张三｜QQ名 老张｜QQ号 12345678] 你好\n"
+        "[发送者：名称 Alice｜ID u-1] hi\n"
+        "[发送者：QQ名 小鱼｜QQ号 87654321] 嗯\n"
+        "[发送者：QQ名 老张｜QQ号 12345678] 再来\n"
+    )
+    assert prompts.sender_ids_in(transcript) == ["12345678", "87654321"]
+    assert prompts.sender_ids_in("") == []
+
+
+def test_strip_analysis():
+    assert prompts.strip_analysis("<analysis>草稿</analysis>\n<summary>s</summary>") == "\n<summary>s</summary>"
+    assert prompts.strip_analysis("前文<ANALYSIS>没闭合的草稿") == "前文"
+    assert prompts.strip_analysis("没有草稿") == "没有草稿"
+    # 忘了闭合：只删到正式输出开始的地方
+    assert prompts.strip_analysis("<analysis>草稿\n<summary>s</summary>") == "<summary>s</summary>"
+
+
+def test_parse_summary_with_unclosed_analysis():
+    summary, drafts = parse_summary_response(
+        '<analysis>草稿没闭合\n<summary>真的</summary>\n'
+        '<memories>[{"type": "user", "name": "user-1", "description": "d", "content": "c"}]</memories>'
+    )
+    assert summary == "真的"
+    assert [d.name for d in drafts] == ["user-1"]
+
+
+def test_parse_summary_ignores_analysis_draft():
+    text = "<analysis>里面提到 <summary>假的</summary></analysis><summary>真的</summary>"
+    summary, _ = parse_summary_response(text)
+    assert summary == "真的"
+
+
+def test_build_existing_section():
+    full = [prompts.ExistingMemory("user-1.md", "阿杰", "---\nname: user-1\n---\n正文")]
+    listed = [prompts.ExistingMemory("project-x.md", ""), prompts.ExistingMemory("b.md", "B")]
+    section = prompts.build_existing_section(full, listed)
+    assert "=== user-1.md ===" in section and "正文" in section
+    assert "- project-x.md：（无描述）" in section
+    assert "- b.md：B" in section
+    assert prompts.build_existing_section([], []) == ""
+
+
+def test_background_extract_prompt_fills_placeholders():
+    prompt = prompts.build_background_extract_prompt("对话{内容}", "\n已有记忆\n")
+    assert "对话{内容}" in prompt
+    assert "已有记忆" in prompt
+    assert "{transcript}" not in prompt and "{rules}" not in prompt
+
+
+def test_data_notice_is_public():
+    assert prompts.DATA_NOTICE

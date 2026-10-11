@@ -14,6 +14,8 @@ import json
 import math
 from typing import Any
 
+from .turns import is_internal_message
+
 CHINESE_WEIGHT = 0.6
 OTHER_WEIGHT = 0.3
 IMAGE_TOKENS = 765
@@ -89,7 +91,12 @@ def estimate_message(message: dict) -> int:
 def estimate_messages(messages: list[dict] | None) -> int:
     if not messages:
         return 0
-    return sum(estimate_message(m) for m in messages if isinstance(m, dict))
+    # 平台内部记录（_checkpoint 等）发给模型前会被剔除，不计入
+    return sum(
+        estimate_message(m)
+        for m in messages
+        if isinstance(m, dict) and not is_internal_message(m)
+    )
 
 
 def _usage_field(obj: Any, key: str) -> Any:

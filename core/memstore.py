@@ -22,8 +22,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 import re
-from dataclasses import dataclass
+import shutil
+import threading
+from dataclasses import dataclass, field
 from pathlib import Path
 
 INDEX_FILENAME = "MEMORY.md"
@@ -37,10 +40,46 @@ MAX_SEARCH_RESULTS = 8
 MAX_SEARCH_EXCERPT = 160
 MAX_HOOK_CHARS = 100
 
+# 召回打分只看文件开头这么多字符，避免个别大文件拖慢每轮的扫描
+HEADER_TEXT_CHARS = 8 * 1024
+MEMORY_TYPES = ("user", "feedback", "project", "reference")
+
 _SAFE_KEY_RE = re.compile(r"[^A-Za-z0-9._-]")
 _SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,120}$")
+# 已经是 safe_key 输出形态的目录名（WebUI 按目录名定位会话时校验用）
+_SCOPE_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 _FRONTMATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n?", re.S)
 _HOOK_WS_RE = re.compile(r"\s+")
+_LINK_RE = re.compile(r"\[\[([^\[\]\n]{1,120})\]\]")
+_INDEX_TARGET_RE = re.compile(r"\]\(([^()\s]+\.md)\)")
+_BLOCK_SCALAR_RE = re.compile(r"^[>|][+-]?$")
+
+
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip())
+
+
+def _frontmatter_lines(block: str) -> list[str]:
+    """把 frontmatter 展开成逻辑行：`key: >-` / `key: |` 的多行值折成一行。"""
+    lines = block.splitlines()
+    result: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        key, sep, value = line.partition(":")
+        if not (sep and _BLOCK_SCALAR_RE.match(value.strip())):
+            result.append(line)
+            i += 1
+            continue
+        indent = _indent(line)
+        parts: list[str] = []
+        i += 1
+        while i < len(lines) and (not lines[i].strip() or _indent(lines[i]) > indent):
+            if lines[i].strip():
+                parts.append(lines[i].strip())
+            i += 1
+        result.append(f"{key}: {' '.join(parts)}")
+    return result
 
 
 def parse_description(content: str) -> tuple[str, bool]:
@@ -51,7 +90,7 @@ def parse_description(content: str) -> tuple[str, bool]:
     """
     match = _FRONTMATTER_RE.match(content)
     if match:
-        for line in match.group(1).splitlines():
+        for line in _frontmatter_lines(match.group(1)):
             stripped = line.strip()
             if stripped.startswith("description:"):
                 desc = stripped.split(":", 1)[1].strip().strip("'\"")
@@ -63,6 +102,78 @@ def parse_description(content: str) -> tuple[str, bool]:
         if cleaned:
             return cleaned, False
     return "", False
+
+
+@dataclass
+class MemoryDoc:
+    """一个记忆文件拆开后的各部分；字段缺失时为空串。"""
+
+    name: str
+    description: str
+    type: str
+    body: str
+    has_frontmatter: bool
+
+
+def parse_memory(content: str) -> MemoryDoc:
+    """拆解记忆文件：frontmatter 的 name / description / type 与正文。
+
+    type 按规范写在 metadata 下一级（metadata:\\n  type: user），也兼容
+    直接写在顶层的 type:，两处都有时以 metadata 下的为准。
+    """
+    match = _FRONTMATTER_RE.match(content or "")
+    fields: dict[str, str] = {}
+    nested_type = ""
+    if match:
+        in_metadata = False
+        for line in _frontmatter_lines(match.group(1)):
+            if not line.strip():
+                continue
+            key, sep, value = line.strip().partition(":")
+            if not sep:
+                continue
+            key = key.strip().lower()
+            value = value.strip().strip("'\"")
+            if line[:1] in (" ", "\t"):
+                if in_metadata and key == "type":
+                    nested_type = value
+                continue
+            in_metadata = key == "metadata" and not value
+            if key in ("name", "description", "type"):
+                fields.setdefault(key, value)
+    body = content[match.end():] if match else (content or "")
+    mem_type = (nested_type or fields.get("type", "")).lower()
+    return MemoryDoc(
+        name=fields.get("name", ""),
+        description=fields.get("description", ""),
+        type=mem_type,
+        body=body.strip("\n"),
+        has_frontmatter=match is not None,
+    )
+
+
+def compose_memory(name: str, description: str, mem_type: str, body: str) -> str:
+    """按标准格式拼出记忆文件：frontmatter（name / description / metadata.type）+ 正文。"""
+    description = _HOOK_WS_RE.sub(" ", description or "").strip()
+    return (
+        "---\n"
+        f"name: {name.strip()}\n"
+        f"description: {description}\n"
+        "metadata:\n"
+        f"  type: {mem_type.strip()}\n"
+        "---\n\n"
+        f"{(body or '').strip()}\n"
+    )
+
+
+def extract_links(text: str) -> list[str]:
+    """正文里的 [[name]] 链接目标（去重保序）。悬空链接也照样返回。"""
+    seen: list[str] = []
+    for match in _LINK_RE.finditer(text or ""):
+        target = match.group(1).strip()
+        if target and target not in seen:
+            seen.append(target)
+    return seen
 
 
 def _clean_hook(description: str) -> str:
@@ -109,6 +220,35 @@ class WriteReport:
     message: str
 
 
+@dataclass
+class MemoryHeader:
+    """记忆文件的头信息：召回打分、WebUI 列表、整理时的清单都用它。"""
+
+    file: str
+    name: str
+    description: str
+    type: str
+    mtime: float
+    size: int
+    # 小写化的文件开头（含 frontmatter），供关键词召回打分
+    text: str = ""
+    links: list[str] = field(default_factory=list)
+
+
+@dataclass
+class IndexReport:
+    """MEMORY.md 的健康状况：体积、是否截断、与实际文件是否对得上。"""
+
+    exists: bool
+    lines: int
+    size: int
+    truncated: bool
+    # 有文件但索引里没有对应行
+    missing: list[str]
+    # 索引行指向的文件已不存在
+    dangling: list[str]
+
+
 def _truncate_index(raw: str) -> IndexSnapshot:
     lines = raw.splitlines()
     total = len(lines)
@@ -137,6 +277,10 @@ class ScopeStore:
     def __init__(self, root: Path):
         self.root = root
         self._lock = asyncio.Lock()
+        # 文件名 -> ((mtime_ns, size), 头信息)；按修改时间失效
+        self._headers: dict[str, tuple[tuple[int, int], MemoryHeader]] = {}
+        # headers() 在工作线程里跑，召回与 WebUI 可能并发调用
+        self._headers_lock = threading.Lock()
 
     # ------------------------------------------------------------ 路径约束
 
@@ -155,6 +299,15 @@ class ScopeStore:
         except ValueError:
             return None
         return path
+
+    @staticmethod
+    def is_valid_name(name: str) -> bool:
+        """文件名本身是否合规（不涉及磁盘）。"""
+        return (
+            bool(name)
+            and name.endswith(MEMORY_FILE_SUFFIX)
+            and bool(_SAFE_NAME_RE.match(name))
+        )
 
     @staticmethod
     def path_rules() -> str:
@@ -182,14 +335,86 @@ class ScopeStore:
             and p.name != INDEX_FILENAME
         )
 
+    def exists(self, name: str) -> bool:
+        path = self._resolve(name)
+        return path is not None and path.is_file()
+
+    def mtime(self, name: str) -> float | None:
+        """文件最近写入时间；不存在或名称非法返回 None。"""
+        path = self._resolve(name)
+        try:
+            return path.stat().st_mtime if path is not None else None
+        except OSError:
+            return None
+
+    def headers(self) -> list[MemoryHeader]:
+        """全部记忆文件的头信息（同步方法，调用方放进线程执行）。
+
+        按 (mtime_ns, size) 缓存：每轮召回都要扫一遍，没改过的文件不重读。
+        """
+        with self._headers_lock:
+            return self._scan_headers()
+
+    def _scan_headers(self) -> list[MemoryHeader]:
+        if not self.root.is_dir():
+            self._headers.clear()
+            return []
+        result: list[MemoryHeader] = []
+        alive: set[str] = set()
+        with os.scandir(self.root) as entries:
+            for entry in entries:
+                name = entry.name
+                if (
+                    not name.endswith(MEMORY_FILE_SUFFIX)
+                    or name == INDEX_FILENAME
+                    or not entry.is_file()
+                ):
+                    continue
+                try:
+                    st = entry.stat()
+                except OSError:
+                    continue
+                alive.add(name)
+                stamp = (st.st_mtime_ns, st.st_size)
+                cached = self._headers.get(name)
+                if cached is not None and cached[0] == stamp:
+                    result.append(cached[1])
+                    continue
+                try:
+                    with open(entry.path, encoding="utf-8", errors="replace") as fh:
+                        content = fh.read(MAX_FILE_BYTES)
+                except OSError:
+                    continue
+                doc = parse_memory(content)
+                description = doc.description or parse_description(content)[0]
+                header = MemoryHeader(
+                    file=name,
+                    name=doc.name or name[: -len(MEMORY_FILE_SUFFIX)],
+                    description=description,
+                    type=doc.type,
+                    mtime=st.st_mtime,
+                    size=st.st_size,
+                    text=content[:HEADER_TEXT_CHARS].lower(),
+                    links=extract_links(doc.body),
+                )
+                self._headers[name] = (stamp, header)
+                result.append(header)
+        for gone in set(self._headers) - alive:
+            del self._headers[gone]
+        result.sort(key=lambda h: h.file)
+        return result
+
     # ------------------------------------------------------------ 写 / 删
 
     async def write(self, name: str, content: str) -> WriteReport:
         """写入记忆文件并自动同步索引行（钩子取自 frontmatter description）。"""
+        # 与 _resolve 同样的归一化：索引守门与索引行都要用整理后的名字，
+        # 否则 " MEMORY.md" / "/MEMORY.md" 能绕过守门，索引行也会写错
+        name = (name or "").strip().lstrip("/")
         path = self._resolve(name)
         if path is None:
             return WriteReport(False, f"文件名不合法：{self.path_rules()}")
-        if name == INDEX_FILENAME:
+        if name.lower() == INDEX_FILENAME.lower():
             return WriteReport(
                 False,
                 "MEMORY.md 索引由插件自动维护，不可直接写入。"
@@ -204,6 +429,7 @@ class ScopeStore:
         description, from_frontmatter = parse_description(content)
         async with self._lock:
             await asyncio.to_thread(self._write_atomic, path, content)
+            self._drop_header(name)
             lines, size = await asyncio.to_thread(
                 self._sync_index_line, name, description
             )
@@ -219,10 +445,11 @@ class ScopeStore:
         return WriteReport(True, message)
 
     async def delete(self, name: str) -> WriteReport:
+        name = (name or "").strip().lstrip("/")
         path = self._resolve(name)
         if path is None:
             return WriteReport(False, f"文件名不合法：{self.path_rules()}")
-        if name == INDEX_FILENAME:
+        if name.lower() == INDEX_FILENAME.lower():
             return WriteReport(
                 False,
                 "MEMORY.md 索引由插件自动维护，不可删除；删除记忆文件时会自动移除对应索引行。",
@@ -231,8 +458,23 @@ class ScopeStore:
             if not path.is_file():
                 return WriteReport(False, f"文件不存在：{name}")
             await asyncio.to_thread(path.unlink)
+            self._drop_header(name)
             await asyncio.to_thread(self._remove_index_line, name)
         return WriteReport(True, f"已删除 {name}，对应索引行已同步移除")
+
+    async def purge(self) -> int:
+        """删除整个作用域目录（全部记忆文件与索引），返回删除的记忆文件数。"""
+        async with self._lock:
+            count = len(self.list_files())
+            if self.root.is_dir():
+                await asyncio.to_thread(shutil.rmtree, self.root)
+            with self._headers_lock:
+                self._headers.clear()
+        return count
+
+    def _drop_header(self, name: str) -> None:
+        with self._headers_lock:
+            self._headers.pop(name, None)
 
     def _write_atomic(self, path: Path, content: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -297,6 +539,89 @@ class ScopeStore:
                 "建议把相关记忆合并进同一个文件、删除多余文件"
             )
         return None
+
+    def index_report(self) -> IndexReport:
+        """索引体检（同步方法）：体积、截断、缺行与悬空行。"""
+        index_path = self.root / INDEX_FILENAME
+        files = set(self.list_files())
+        if not index_path.is_file():
+            return IndexReport(False, 0, 0, False, sorted(files), [])
+        raw = index_path.read_text("utf-8")
+        listed: list[str] = []
+        for line in raw.splitlines():
+            match = _INDEX_TARGET_RE.search(line)
+            if match and match.group(1) not in listed:
+                listed.append(match.group(1))
+        snap = _truncate_index(raw)
+        return IndexReport(
+            exists=True,
+            lines=snap.total_lines,
+            size=len(raw.encode("utf-8")),
+            truncated=snap.truncated,
+            missing=sorted(files - set(listed)),
+            dangling=[name for name in listed if name not in files],
+        )
+
+    async def write_index(self, content: str) -> WriteReport:
+        """管理员手工改写 MEMORY.md（调整分组、顺序、措辞）。
+
+        模型不能直接写索引；这个入口只给 WebUI 用。
+        """
+        if len(content.encode("utf-8")) > MAX_FILE_BYTES:
+            return WriteReport(
+                False, f"内容超过单文件上限 {MAX_FILE_BYTES // 1024}KB"
+            )
+        text = content.strip("\n")
+        async with self._lock:
+            await asyncio.to_thread(
+                self._write_atomic,
+                self.root / INDEX_FILENAME,
+                text + "\n" if text else "",
+            )
+        message = "索引已保存"
+        health = self._index_health(
+            len(text.splitlines()), len(text.encode("utf-8"))
+        )
+        if health:
+            message += "。" + health
+        return WriteReport(True, message)
+
+    async def rebuild_index(self) -> int:
+        """按磁盘上的实际文件重建 MEMORY.md，返回索引行数。
+
+        已有行原位刷新钩子、保留手工加的标题与分组，指向不存在文件的行
+        删掉，没登记的文件追加到末尾。用于手工改动文件目录之后的修复。
+        """
+        async with self._lock:
+            return await asyncio.to_thread(self._rebuild_index_sync)
+
+    def _rebuild_index_sync(self) -> int:
+        headers = {h.file: h for h in self.headers()}
+        index_path = self.root / INDEX_FILENAME
+        existing = index_path.read_text("utf-8") if index_path.is_file() else ""
+        lines: list[str] = []
+        listed: set[str] = set()
+        for line in existing.splitlines():
+            match = _INDEX_TARGET_RE.search(line)
+            if not match:
+                lines.append(line)
+                continue
+            target = match.group(1)
+            header = headers.get(target)
+            if header is None or target in listed:
+                continue
+            listed.add(target)
+            lines.append(format_index_line(target, header.description))
+        for name, header in headers.items():
+            if name not in listed:
+                lines.append(format_index_line(name, header.description))
+        text = "\n".join(lines).strip("\n")
+        if not text and not headers:
+            if index_path.is_file():
+                index_path.unlink()
+            return 0
+        self._write_atomic(index_path, text + "\n")
+        return len(headers)
 
     # ------------------------------------------------------------ 索引加载
 
@@ -363,3 +688,22 @@ class MemoryStore:
 
     def session_scope(self, session_key: str) -> ScopeStore:
         return self._scope(self.base_dir / "session" / safe_key(session_key))
+
+    def session_scope_by_key(self, key: str) -> ScopeStore | None:
+        """按目录名（safe_key 的输出）取会话作用域；目录名不合法返回 None。"""
+        if not is_scope_key(key):
+            return None
+        return self._scope(self.base_dir / "session" / key)
+
+    def session_keys(self) -> list[str]:
+        """磁盘上已有记忆目录的会话（目录名）。"""
+        root = self.base_dir / "session"
+        if not root.is_dir():
+            return []
+        return sorted(
+            p.name for p in root.iterdir() if p.is_dir() and is_scope_key(p.name)
+        )
+
+
+def is_scope_key(key: str) -> bool:
+    return bool(key) and bool(_SCOPE_KEY_RE.match(key))

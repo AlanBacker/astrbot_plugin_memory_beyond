@@ -1,4 +1,4 @@
-from core.turns import is_tool_result, split_leading_system, split_turns
+from core.turns import is_internal_message, is_tool_result, split_leading_system, split_turns
 
 
 def _history():
@@ -51,3 +51,10 @@ def test_split_turns_skips_non_dict():
     turns = split_turns([{"role": "user", "content": "q"}, "junk"])
     assert len(turns) == 1
     assert len(turns[0].messages) == 1
+
+
+def test_is_internal_message():
+    assert is_internal_message({"role": "_checkpoint", "content": {"id": "x"}})
+    assert not is_internal_message({"role": "user", "content": "hi"})
+    assert not is_internal_message({"role": None})
+    assert not is_internal_message("junk")

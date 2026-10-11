@@ -3,8 +3,10 @@
 核心理念：真相在磁盘，上下文只带索引，细节按需取回，压缩后从磁盘重新注入。
 
 分层约定：
-    main.py  —— 平台适配层（本文件）：钩子、LLM 工具、指令、provider 调用
-    core/    —— 纯逻辑：记忆库、索引、token 估算、轮次切分、压缩状态机
+    main.py     —— 平台适配层（本文件）：钩子、LLM 工具、指令、provider 调用
+    web_api.py  —— WebUI 记忆管理页的后端接口（页面在 pages/memory）
+    core/       —— 纯逻辑：记忆库、索引、召回、token 估算、轮次切分、
+                   压缩状态机、会话登记、压缩归档、记忆整理
 
 兼容性立场：只依赖 @filter.on_llm_request() / @filter.on_llm_response() /
 @filter.llm_tool() 等公开插件接口，不 import AstrBot 内部实现、不 monkey-patch。
@@ -30,8 +32,9 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star, StarTools
 
-from .core import compress, memstore, prompts, tokens
-from .core.turns import split_leading_system
+from .core import archive, compress, memstore, prompts, recall, registry, tokens
+from .core.turns import split_leading_system, split_turns
+from .web_api import MemoryDashboard
 
 PLUGIN_NAME = "astrbot_plugin_memory_beyond"
 LOG_PREFIX = "[memory_beyond] "
@@ -49,6 +52,8 @@ MIN_TAIL_BUDGET = 1000
 GLOBAL_MEMORY_OFF = "全局记忆已在插件配置中停用；请改用 session 作用域。"
 # 会话运行时缓存上限（LRU 淘汰，仅内存快照，磁盘状态不受影响）。
 MAX_RUNTIME_SESSIONS = 256
+# 模型挑选召回记忆时的单次超时：挑选在回复之前完成，等太久不如退回关键词
+RECALL_SELECT_TIMEOUT = 15
 
 # 自动探测模型上下文窗口的对照表：子串匹配，先命中先用。
 # 探测只是兜底，README 中明确建议手动配置 max_context_tokens。
@@ -99,9 +104,11 @@ def tool_schema_cost(toolset, estimator: tokens.TokenEstimator) -> int:
 class RuntimeSession:
     """一个会话的内存态：压缩状态 + 索引快照缓存。
 
-    索引在会话首次请求时读盘一次、缓存快照复用（prompt caching 按前缀匹配，
-    注入内容逐轮变化会让缓存全量失效）；中途新存的记忆只写磁盘。
-    压缩发生时清空快照、从磁盘重新加载——这是记忆扛过压缩的核心机制。
+    索引在对话开始时读盘一次、之后复用快照（prompt caching 按前缀匹配，
+    开头的注入内容一变，整段历史的缓存全部失效）。对话中途模型新写的
+    记忆只落盘、不刷新快照——需要时由每轮的相关记忆召回带上全文。
+    压缩发生时清空快照、从磁盘重新加载——这是记忆扛过压缩的核心机制；
+    对话切换、管理员在 WebUI 改动记忆时同样刷新。
     """
 
     state: compress.SessionState
@@ -116,17 +123,25 @@ class RuntimeSession:
     warned_window: bool = False
     warned_summarizer: bool = False
     warned_clip: bool = False
+    # 后台提取进行中（同一会话不并发提取）
+    extracting: bool = False
 
 
 class MemoryBeyondPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
-        super().__init__(context)
+        super().__init__(context, config)
         self.config = config if config is not None else {}
         data_dir = self._resolve_data_dir()
+        self.data_dir = data_dir
         self._store = memstore.MemoryStore(data_dir / "memories")
         self._state_dir = data_dir / "state"
+        self._registry = registry.SessionRegistry(data_dir / "sessions.json")
+        self._archive = archive.ArchiveStore(data_dir / "archive")
         self._sessions: OrderedDict[str, RuntimeSession] = OrderedDict()
+        self._tasks: set[asyncio.Task] = set()
         self._warned_threshold = False
+        self.dashboard = MemoryDashboard(self)
+        self.dashboard.register()
 
         threshold, warning = compress.validate_threshold(
             self.config.get("compress_threshold", compress.THRESHOLD_FALLBACK)
@@ -208,21 +223,46 @@ class MemoryBeyondPlugin(Star):
             rt.index_block = None
             rt.index_loaded = False
 
-    def _state_path(self, umo: str) -> Path:
-        return self._state_dir / f"{memstore.safe_key(umo)}.json"
+    def runtime_for_key(self, key: str) -> tuple[str, RuntimeSession] | None:
+        """按会话目录名找到已加载的运行时（WebUI 改动后同步内存态用）。"""
+        for umo, rt in self._sessions.items():
+            if memstore.safe_key(umo) == key:
+                return umo, rt
+        return None
 
-    async def _load_state(self, umo: str) -> compress.SessionState:
-        path = self._state_path(umo)
+    def invalidate_for_key(self, key: str | None) -> None:
+        """WebUI 改动记忆后作废对应会话的索引快照；key 为 None 表示全局记忆。"""
+        if key is None:
+            self._invalidate_index_cache(None)
+            return
+        found = self.runtime_for_key(key)
+        if found is not None:
+            self._invalidate_index_cache(found[0])
+
+    def state_path_for_key(self, key: str) -> Path:
+        return self._state_dir / f"{key}.json"
+
+    def _state_path(self, umo: str) -> Path:
+        return self.state_path_for_key(memstore.safe_key(umo))
+
+    async def load_state_file(self, path: Path) -> compress.SessionState:
         try:
             if path.is_file():
                 raw = await asyncio.to_thread(path.read_text, "utf-8")
                 return compress.SessionState.from_dict(json.loads(raw))
         except (OSError, ValueError) as exc:
-            logger.warning(LOG_PREFIX + f"读取压缩状态失败（{umo}）：{exc}")
+            logger.warning(LOG_PREFIX + f"读取压缩状态失败（{path.name}）：{exc}")
         return compress.SessionState()
 
+    async def _load_state(self, umo: str) -> compress.SessionState:
+        return await self.load_state_file(self._state_path(umo))
+
     async def _save_state(self, umo: str, state: compress.SessionState) -> None:
-        path = self._state_path(umo)
+        await self.save_state_file(self._state_path(umo), state)
+
+    async def save_state_file(
+        self, path: Path, state: compress.SessionState
+    ) -> None:
 
         def _write() -> None:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -235,7 +275,29 @@ class MemoryBeyondPlugin(Star):
         try:
             await asyncio.to_thread(_write)
         except OSError as exc:
-            logger.warning(LOG_PREFIX + f"持久化压缩状态失败（{umo}）：{exc}")
+            logger.warning(LOG_PREFIX + f"持久化压缩状态失败（{path.name}）：{exc}")
+
+    def _spawn(self, coro, desc: str) -> None:
+        """启动后台任务并保留引用（插件卸载时统一取消）。"""
+        task = asyncio.create_task(coro, name=f"memory_beyond:{desc}")
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    def _touch_registry(self, event: AstrMessageEvent, umo: str) -> bool:
+        """登记会话活跃；返回是否需要落盘。登记失败不影响请求。"""
+        try:
+            return self._registry.touch(
+                memstore.safe_key(umo), umo, self._session_label(event)
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug(LOG_PREFIX + "会话登记失败", exc_info=True)
+            return False
+
+    async def _flush_registry(self) -> None:
+        try:
+            await asyncio.to_thread(self._registry.flush)
+        except OSError as exc:
+            logger.warning(LOG_PREFIX + f"会话登记簿写盘失败：{exc}")
 
     # ============================================================ 身份与作用域
 
@@ -281,6 +343,40 @@ class MemoryBeyondPlugin(Star):
             return qq_name, group_card, is_group
         return None, None, is_group
 
+    @classmethod
+    def _session_label(cls, event: AstrMessageEvent) -> str:
+        """会话的可读名称：群聊取平台提供的群名，私聊取对方昵称。"""
+        msg_obj = getattr(event, "message_obj", None)
+        group = getattr(msg_obj, "group", None)
+        group_name = str(getattr(group, "group_name", "") or "").strip()
+        if group_name and group_name.upper() != "N/A":
+            return group_name
+        if getattr(msg_obj, "group_id", ""):
+            return ""
+        return cls._sender_identity(event)[1]
+
+    @staticmethod
+    def _mentioned_ids(event: AstrMessageEvent) -> list[str]:
+        """本条消息 @ 到的人与被回复消息的发送者（数字 ID），不含机器人自己。"""
+        try:
+            self_id = str(event.get_self_id() or "")
+        except Exception:  # noqa: BLE001
+            self_id = ""
+        try:
+            segments = list(event.get_messages() or [])
+        except Exception:  # noqa: BLE001
+            return []
+        ids: list[str] = []
+        for seg in segments:
+            if type(seg).__name__ == "Reply":
+                raw = getattr(seg, "sender_id", None)
+            else:
+                raw = getattr(seg, "qq", None)
+            uid = str(raw or "").strip()
+            if uid.isdigit() and uid != self_id and uid not in ids:
+                ids.append(uid)
+        return ids
+
     def _global_on(self) -> bool:
         """全局记忆开关，默认关闭。关闭时不注入全局索引、拒绝全局读写，
         机器人只使用当前会话的记忆；磁盘上已有的全局文件原样保留。"""
@@ -321,8 +417,16 @@ class MemoryBeyondPlugin(Star):
         umo = str(getattr(event, "unified_msg_origin", "") or "")
         if not umo:
             return
+        # 其他插件自行发起的模型调用（event.request_llm，不带对话也没有历史）
+        # 同样经过这个钩子：它不是本会话的对话请求，不注入也不动压缩状态——
+        # 否则"没有历史"会被当成对话被清空，把摘要作废
+        if getattr(req, "conversation", None) is None and not (req.contexts or []):
+            return
         rt = await self._runtime(umo)
         state = rt.state
+        now = time.time()
+        if self._touch_registry(event, umo):
+            await self._flush_registry()
         # v1.2.5 之前注入的索引块会被 AstrBot 回存进平台历史，读入时清掉
         # 这些副本（现在注入块带 _no_save 不再入史，此过滤兼作历史自愈）
         contexts = [
@@ -377,22 +481,33 @@ class MemoryBeyondPlugin(Star):
             rt.index_block = None
             rt.index_loaded = False
 
+        # 召回打分用用户原话：取在加发送者标注之前
+        query = str(req.prompt or "")
+
         # ---- 发送者标注：注入数字 ID，让记人不依赖可变可冒用的昵称 ----
         if self._bool("annotate_sender", True):
             self._annotate_sender(event, req)
 
-        # ---- 记忆索引块（会话内快照；新对话、压缩后、写入后从磁盘刷新） ----
+        n_system = split_leading_system(contexts)
         memory_on = self._bool("enable_memory", True)
+
+        # ---- 后台定期提取：每隔 N 轮把最近的对话交给模型补记长期事实 ----
+        if memory_on:
+            self._maybe_extract(rt, umo, contexts, n_system, now)
+
+        # ---- 记忆索引块（对话内快照；新对话、压缩后、WebUI 改动后从磁盘刷新） ----
         index_msg = None
+        recall_msg = None
         if memory_on:
             block = await self._index_block(rt, event)
             if block:
                 index_msg = prompts.build_index_message(block)
+            # ---- 相关记忆召回：本轮用得上的记忆全文附在新消息之前 ----
+            recall_msg = await self._recall_message(event, umo, query)
 
         guidance = prompts.memory_guidance(self._global_on()) if memory_on else ""
         estimator = tokens.TokenEstimator(state.ratio)
 
-        n_system = split_leading_system(contexts)
         overhead = (
             estimator.messages(contexts[:n_system])
             + estimator.text(str(req.system_prompt or "") + guidance)
@@ -403,10 +518,27 @@ class MemoryBeyondPlugin(Star):
         )
         tools_cost = tool_schema_cost(getattr(req, "func_tool", None), estimator)
         index_cost = estimator.messages([index_msg]) if index_msg else 0
+        recall_cost = estimator.messages([recall_msg]) if recall_msg else 0
+
+        # ---- 缓存已冷时清理旧工具结果：整段前缀反正要重新计费 ----
+        idle_minutes = self._int("tool_result_idle_minutes", 60)
+        cache_cold = (
+            idle_minutes > 0
+            and state.last_request_at > 0
+            and now - state.last_request_at >= idle_minutes * 60
+        )
+        cleared_total = 0
 
         def current_tail() -> list[dict]:
+            nonlocal cleared_total
             mark = max(state.watermark, n_system) if state.watermark else n_system
-            return contexts[mark:]
+            tail = contexts[mark:]
+            if cache_cold:
+                tail, cleared = compress.clear_old_tool_results(
+                    tail, self._int("keep_recent_turns", 3)
+                )
+                cleared_total = cleared
+            return tail
 
         # ---- 抢先压缩 ----
         window, window_note = await self._resolve_window(event)
@@ -419,15 +551,10 @@ class MemoryBeyondPlugin(Star):
         clipped = False
         if compress_on and window > 0:
             threshold_tokens = int(window * self._threshold())
+            fixed = overhead + tools_cost + index_cost + recall_cost
 
             def total_now() -> int:
-                return (
-                    overhead
-                    + tools_cost
-                    + index_cost
-                    + estimator.text(state.summary)
-                    + estimator.messages(tail)
-                )
+                return fixed + estimator.text(state.summary) + estimator.messages(tail)
 
             total = total_now()
             if total > threshold_tokens:
@@ -442,9 +569,7 @@ class MemoryBeyondPlugin(Star):
             if total > threshold_tokens:
                 budget = (
                     int(window * self._target_ratio())
-                    - overhead
-                    - tools_cost
-                    - index_cost
+                    - fixed
                     - estimator.text(state.summary)
                 )
                 tail, clipped = compress.fit_tail_to_budget(
@@ -461,8 +586,14 @@ class MemoryBeyondPlugin(Star):
                 else:
                     rt.warned_clip = True
                     logger.warning(message)
+        if cleared_total:
+            logger.info(
+                LOG_PREFIX
+                + f"会话 {umo} 空闲超过 {idle_minutes} 分钟，提示词缓存已冷，"
+                f"清理了 {cleared_total} 条较早的工具结果"
+            )
 
-        # ---- 拼装发送视图：system 消息 + 索引块 + 摘要块 + 原文尾部 ----
+        # ---- 拼装发送视图：system 消息 + 索引块 + 摘要块 + 原文尾部 + 召回块 ----
         summary_msg = (
             prompts.build_summary_message(state.summary) if state.summary else None
         )
@@ -472,6 +603,9 @@ class MemoryBeyondPlugin(Star):
         if summary_msg:
             view.append(summary_msg)
         view.extend(tail)
+        # 召回块放在最末（紧挨着本轮新消息）：逐轮变化也不破坏前缀缓存
+        if recall_msg:
+            view.append(recall_msg)
         req.contexts = view
 
         if guidance and guidance not in str(req.system_prompt or ""):
@@ -479,17 +613,17 @@ class MemoryBeyondPlugin(Star):
 
         summary_cost = estimator.messages([summary_msg]) if summary_msg else 0
         tail_cost = estimator.messages(tail)
-        state.last_estimate = (
-            overhead + tools_cost + index_cost + summary_cost + tail_cost
-        )
-        # 分项构成随估算落盘，mb_status 用它解释数值由什么组成
+        # 分项构成随估算落盘，mb_status 与 WebUI 用它解释数值由什么组成
         state.last_parts = {
             "overhead": overhead,
             "tools": tools_cost,
             "index": index_cost,
             "summary": summary_cost,
+            "recall": recall_cost,
             "history": tail_cost,
         }
+        state.last_estimate = sum(state.last_parts.values())
+        state.last_request_at = now
         rt.awaiting_calibration = True
         # 估算值随状态落盘，重启/重载插件后 mb_status 仍能给出上一次的统计
         await self._save_state(umo, state)
@@ -554,6 +688,207 @@ class MemoryBeyondPlugin(Star):
         rt.index_global_on = global_on
         return rt.index_block
 
+    # ============================================================ 召回
+
+    async def _recall_message(
+        self, event: AstrMessageEvent, umo: str, query: str
+    ) -> dict | None:
+        """挑出本轮相关的记忆，拼成附在新消息之前的召回块；失败只记日志。"""
+        mode = self._str("recall_mode", "keyword").strip().lower()
+        limit = self._int("recall_max_files", recall.DEFAULT_MAX_FILES)
+        if mode == "off" or limit <= 0:
+            return None
+        try:
+            scopes: list[tuple[str, memstore.ScopeStore]] = [
+                ("session", self._store.session_scope(umo))
+            ]
+            if self._global_on():
+                scopes.append(("global", self._global_scope()))
+            candidates: list[recall.Candidate] = []
+            stores: dict[str, memstore.ScopeStore] = {}
+            for label, store in scopes:
+                stores[label] = store
+                for header in await asyncio.to_thread(store.headers):
+                    candidates.append(recall.Candidate(label, header))
+            if not candidates:
+                return None
+            query = prompts.strip_sender_tag(query)
+            sender_id, _ = self._sender_identity(event)
+            forced = recall.identity_files(
+                sender_id, self._mentioned_ids(event), query
+            )
+            chosen = None
+            if mode == "llm" and query.strip():
+                chosen = await self._select_by_model(umo, candidates, query, limit)
+                if chosen is not None:
+                    keyword_forced = recall.select_by_keywords(
+                        candidates, "", forced, limit
+                    )
+                    merged = keyword_forced + [c for c in chosen if c not in keyword_forced]
+                    chosen = merged[:limit]
+            if chosen is None:
+                chosen = recall.select_by_keywords(candidates, query, forced, limit)
+            items: list[recall.Recalled] = []
+            for cand in chosen:
+                content = await stores[cand.scope].read(cand.header.file)
+                if content:
+                    items.append(
+                        recall.Recalled(cand.ref, content, cand.header.mtime)
+                    )
+            block = recall.build_recall_block(items, prompts.DATA_NOTICE)
+            return recall.build_recall_message(block) if block else None
+        except Exception:  # noqa: BLE001 - 召回是锦上添花，失败不影响本轮
+            logger.warning(LOG_PREFIX + f"会话 {umo} 相关记忆召回失败", exc_info=True)
+            return None
+
+    async def _select_by_model(
+        self,
+        umo: str,
+        candidates: list[recall.Candidate],
+        query: str,
+        limit: int,
+    ) -> list[recall.Candidate] | None:
+        """让摘要模型从记忆清单里挑选；调用失败返回 None（退回关键词）。"""
+        prompt = recall.build_selector_prompt(candidates, query, limit)
+        text, attempts_log = await self._call_summarizer(
+            umo, prompt, attempts=1, timeout=RECALL_SELECT_TIMEOUT
+        )
+        if not text:
+            logger.debug(
+                LOG_PREFIX + f"模型挑选召回失败，退回关键词：{'; '.join(attempts_log)}"
+            )
+            return None
+        chosen = recall.parse_selector_response(text, candidates)
+        if chosen is None:
+            logger.debug(LOG_PREFIX + "模型挑选结果无法解析，退回关键词")
+            return None
+        return chosen[:limit]
+
+    # ============================================================ 记忆提取
+
+    async def _existing_for_extract(
+        self, scope: memstore.ScopeStore, transcript: str
+    ) -> tuple[str, set[str]]:
+        """抽取前给模型看的已有记忆：相关的附全文（可合并改写），其余只列名字。
+
+        返回 (提示词片段, 允许被改写的文件名集合)。
+        """
+        headers = await asyncio.to_thread(scope.headers)
+        if not headers:
+            return "", set()
+        candidates = [recall.Candidate("session", h) for h in headers]
+        forced = [f"user-{uid}.md" for uid in prompts.sender_ids_in(transcript)]
+        related = recall.select_by_keywords(
+            candidates, transcript, forced, recall.DEFAULT_MAX_FILES
+        )
+        full: list[prompts.ExistingMemory] = []
+        used = 0
+        for cand in related:
+            content = await scope.read(cand.header.file)
+            if not content or used + len(content) > prompts.EXISTING_FULL_CHARS:
+                continue
+            used += len(content)
+            full.append(
+                prompts.ExistingMemory(
+                    cand.header.file, cand.header.description, content
+                )
+            )
+        updatable = {item.file for item in full}
+        listed = [
+            prompts.ExistingMemory(h.file, h.description)
+            for h in headers
+            if h.file not in updatable
+        ]
+        return prompts.build_existing_section(full, listed), updatable
+
+    async def _store_drafts(
+        self,
+        umo: str,
+        drafts: list[prompts.MemoryDraft],
+        updatable: set[str],
+        source: str,
+    ) -> int:
+        """抽取出的记忆落盘到会话作用域。
+
+        自动提取的信息可能源自群聊，按隐私边界只进会话作用域、绝不进全局。
+        已存在的文件只有在抽取时附过全文（模型据此合并）才允许改写，
+        其余同名条目跳过——看不到原文就覆盖会丢内容。
+        """
+        scope = self._store.session_scope(umo)
+        stored = 0
+        for draft in drafts:
+            try:
+                if draft.filename not in updatable and scope.exists(draft.filename):
+                    continue
+                report = await scope.write(
+                    draft.filename, prompts.render_memory_file(draft)
+                )
+                if report.ok:
+                    # 索引行由 write 按 frontmatter description 自动同步
+                    stored += 1
+            except OSError as exc:
+                logger.warning(
+                    LOG_PREFIX + f"{source}写入记忆 {draft.filename} 失败：{exc}"
+                )
+        if stored:
+            logger.info(LOG_PREFIX + f"会话 {umo} {source}写入了 {stored} 条记忆")
+        return stored
+
+    def _maybe_extract(
+        self,
+        rt: RuntimeSession,
+        umo: str,
+        contexts: list[dict],
+        n_system: int,
+        now: float,
+    ) -> None:
+        """每隔 auto_extract_interval 轮，在后台把最近的对话交给模型补记长期事实。
+
+        主模型在这段时间里自己写过记忆就跳过：它已经在记，这一段交给它。
+        提取在后台进行，不拖慢本轮回复；同一会话同时只有一个提取任务。
+        """
+        interval = self._int("auto_extract_interval", 10)
+        state = rt.state
+        if interval <= 0:
+            return
+        state.turns_since_extract += 1
+        if state.turns_since_extract < interval or rt.extracting:
+            return
+        state.turns_since_extract = 0
+        if state.wrote_since_extract:
+            state.wrote_since_extract = False
+            return
+        turns = split_turns(contexts, n_system)[-interval:]
+        messages = [m for turn in turns for m in turn.messages]
+        transcript = compress.render_transcript(messages)
+        if not transcript.strip():
+            return
+        state.extracted_at = now
+        rt.extracting = True
+        self._spawn(self._run_extraction(rt, umo, transcript), f"extract:{umo}")
+
+    async def _run_extraction(
+        self, rt: RuntimeSession, umo: str, transcript: str
+    ) -> None:
+        try:
+            scope = self._store.session_scope(umo)
+            existing, updatable = await self._existing_for_extract(scope, transcript)
+            prompt = prompts.build_background_extract_prompt(transcript, existing)
+            text, attempts_log = await self._call_summarizer(umo, prompt)
+            if not text:
+                logger.info(
+                    LOG_PREFIX
+                    + f"会话 {umo} 后台记忆提取未完成（{'; '.join(attempts_log) or '无可用提供商'}），"
+                    "下个周期再试"
+                )
+                return
+            drafts = prompts.parse_memories(text)
+            await self._store_drafts(umo, drafts, updatable, "后台提取")
+        except Exception:  # noqa: BLE001
+            logger.warning(LOG_PREFIX + f"会话 {umo} 后台记忆提取出错", exc_info=True)
+        finally:
+            rt.extracting = False
+
     # ============================================================ 压缩执行
 
     async def _compress(
@@ -580,14 +915,22 @@ class MemoryBeyondPlugin(Star):
         if not transcript.strip():
             return
 
-        extract = self._bool("extract_memories", True)
+        extract = self._bool("extract_memories", True) and self._bool(
+            "enable_memory", True
+        )
+        existing, updatable = "", set()
+        if extract:
+            existing, updatable = await self._existing_for_extract(
+                self._store.session_scope(umo), transcript
+            )
         prompt = prompts.build_summary_prompt(
             self._str("summary_prompt_template"),
             state.summary,
             transcript,
             extract,
+            existing,
         )
-        text, attempts_log = await self._call_summarizer(event, prompt)
+        text, attempts_log = await self._call_summarizer(umo, prompt)
         if text:
             summary, drafts = prompts.parse_summary_response(text)
         else:
@@ -616,52 +959,56 @@ class MemoryBeyondPlugin(Star):
             f"（共 {len(contexts)} 条），压缩前估算 {total_estimate} tokens，"
             f"摘要 {len(state.summary)} 字"
         )
+        await self._archive_compressed(umo, state, plan.to_summarize)
 
         if extract and drafts:
-            await self._store_extracted(umo, drafts)
+            await self._store_drafts(umo, drafts, updatable, "压缩联动提取")
         # 压缩后从磁盘重新注入记忆索引：清空快照，下次请求重新加载。
         # 索引不是靠"被摘要保留下来"，而是每次从源头重新加载。
         rt.index_block = None
         rt.index_loaded = False
 
-    async def _store_extracted(
-        self, umo: str, drafts: list[prompts.MemoryDraft]
+    async def _archive_compressed(
+        self, umo: str, state: compress.SessionState, messages: list[dict]
     ) -> None:
-        """压缩-记忆联动：摘要的同一次 LLM 调用里提取的事实落盘为记忆文件。
-
-        自动提取的信息可能源自群聊，按隐私边界只进会话作用域，绝不进全局。
-        """
-        scope = self._store.session_scope(umo)
-        stored = 0
-        for draft in drafts:
-            try:
-                if await scope.read(draft.filename) is not None:
-                    continue
-                report = await scope.write(
-                    draft.filename, prompts.render_memory_file(draft)
+        """把刚被摘要覆盖、即将从平台历史卸下的原文另存一份。"""
+        keep = self._int("archive_keep", 20)
+        if keep <= 0:
+            return
+        try:
+            await asyncio.to_thread(
+                lambda: self._archive.save(
+                    memstore.safe_key(umo),
+                    umo=umo,
+                    cid=state.cid,
+                    messages=messages,
+                    summary=state.summary,
+                    keep=keep,
                 )
-                if report.ok:
-                    # 索引行由 write 按 frontmatter description 自动同步
-                    stored += 1
-            except OSError as exc:
-                logger.warning(
-                    LOG_PREFIX + f"压缩联动写入记忆 {draft.filename} 失败：{exc}"
-                )
-        if stored:
-            logger.info(LOG_PREFIX + f"会话 {umo} 压缩联动提取了 {stored} 条记忆入库")
+            )
+        except OSError as exc:
+            logger.warning(LOG_PREFIX + f"会话 {umo} 压缩归档写盘失败：{exc}")
 
     # ============================================================ 摘要调用链
 
     async def _call_summarizer(
-        self, event: AstrMessageEvent, prompt: str
+        self,
+        umo: str | None,
+        prompt: str,
+        *,
+        attempts: int | None = None,
+        timeout: int | None = None,
     ) -> tuple[str | None, list[str]]:
         """按回退链调用摘要模型：配置的提供商（重试 N 次）→ 当前对话提供商。
 
+        umo 为 None 时（WebUI 发起的整理）当前提供商取默认提供商。
+        attempts / timeout 不传时按配置；召回挑选这类要求快的调用只试一次。
         返回 (成功文本或 None, 尝试记录)。全部失败的兜底不在这里——由调用方
-        记录失败进入退避冷却，本轮走应急裁剪视图。
+        决定（压缩记录失败进入退避冷却，召回退回关键词）。
         """
-        timeout = max(10, self._int("summary_timeout", 120))
-        retries = max(1, self._int("summary_retry_count", 3))
+        if timeout is None:
+            timeout = max(10, self._int("summary_timeout", 120))
+        retries = attempts or max(1, self._int("summary_retry_count", 3))
         attempts_log: list[str] = []
 
         chain: list[tuple[str, object, int]] = []
@@ -676,14 +1023,13 @@ class MemoryBeyondPlugin(Star):
                 )
             else:
                 chain.append((f"配置提供商 {configured_id}", provider, retries))
-        current = await self._current_provider(event)
+        current = await self._current_provider(umo)
         if current is not None and all(current is not p for _, p, _ in chain):
-            chain.append(
-                ("当前对话提供商", current, retries if not chain else FALLBACK_ATTEMPTS)
-            )
+            fallback = retries if not chain else min(retries, FALLBACK_ATTEMPTS)
+            chain.append(("当前对话提供商", current, fallback))
 
-        for label, provider, attempts in chain:
-            for attempt in range(1, attempts + 1):
+        for label, provider, tries in chain:
+            for attempt in range(1, tries + 1):
                 try:
                     resp = await asyncio.wait_for(
                         provider.text_chat(prompt=prompt), timeout=timeout
@@ -697,9 +1043,13 @@ class MemoryBeyondPlugin(Star):
                     attempts_log.append(f"{label} 第 {attempt} 次超时（{timeout}s）")
                 except Exception as exc:  # noqa: BLE001 - provider 实现不可控
                     attempts_log.append(f"{label} 第 {attempt} 次失败：{exc}")
-                if attempt < attempts:
+                if attempt < tries:
                     await asyncio.sleep(min(2 ** (attempt - 1), 4))
         return None, attempts_log
+
+    async def call_summarizer(self, prompt: str) -> tuple[str | None, list[str]]:
+        """供 WebUI 使用的摘要模型调用（不绑定会话）。"""
+        return await self._call_summarizer(None, prompt)
 
     @staticmethod
     async def _maybe_await(value):
@@ -716,11 +1066,9 @@ class MemoryBeyondPlugin(Star):
             logger.warning(LOG_PREFIX + f"按 ID 获取提供商 {provider_id} 失败：{exc}")
         return None
 
-    async def _current_provider(self, event: AstrMessageEvent):
+    async def _current_provider(self, umo: str | None):
         try:
-            return await self._maybe_await(
-                self.context.get_using_provider(umo=event.unified_msg_origin)
-            )
+            return await self._maybe_await(self.context.get_using_provider(umo=umo))
         except TypeError:
             try:
                 return await self._maybe_await(self.context.get_using_provider())
@@ -746,7 +1094,9 @@ class MemoryBeyondPlugin(Star):
         configured = self._int("max_context_tokens", 0)
         if configured > 0:
             return configured, "手动配置"
-        provider = await self._current_provider(event)
+        provider = await self._current_provider(
+            str(getattr(event, "unified_msg_origin", "") or "") or None
+        )
         model = self._provider_model_name(provider)
         if model:
             lowered = model.lower()
@@ -791,6 +1141,14 @@ class MemoryBeyondPlugin(Star):
             umo = str(getattr(event, "unified_msg_origin", ""))
             rt = self._sessions.get(umo)
             if rt is None or not rt.awaiting_calibration:
+                return
+            # 其他插件自行发起的调用（不带对话、没有历史）与本会话的估算不配对
+            preq = getattr(event, "get_extra", lambda _k: None)("provider_request")
+            if (
+                preq is not None
+                and getattr(preq, "conversation", None) is None
+                and not (getattr(preq, "contexts", None) or [])
+            ):
                 return
             rt.awaiting_calibration = False
             if rt.state.last_estimate <= 0:
@@ -861,6 +1219,11 @@ class MemoryBeyondPlugin(Star):
             existing = store.list_files()
             listing = "、".join(existing) if existing else "（该作用域还没有记忆文件）"
             return f"文件 {file} 不存在。该作用域现有文件：{listing}"
+        if file.strip() != memstore.INDEX_FILENAME:
+            mtime = store.mtime(file)
+            note = recall.freshness_note(mtime) if mtime else ""
+            if note:
+                return f"{note}\n\n{content}"
         return content
 
     @filter.llm_tool(name="memory_write")
@@ -895,9 +1258,14 @@ class MemoryBeyondPlugin(Star):
                 return "content 为空。写入需提供完整文件内容；如要删除请设 delete=true。"
             report = await store.write(file, content)
         if report.ok:
-            # 记忆已变化，作废索引快照：session 只影响本会话，global 影响全部
+            # 索引快照不在这里刷新：开头的注入内容一变，整段历史的提示词
+            # 缓存都会失效。新写的记忆已在磁盘上，相关时由召回带上全文，
+            # 下次压缩或新对话时进入索引。这里只记下"主模型自己记过了"，
+            # 后台定期提取据此跳过这一段。
             umo = str(getattr(event, "unified_msg_origin", "") or "")
-            self._invalidate_index_cache(umo if scope == "session" else None)
+            rt = self._sessions.get(umo)
+            if rt is not None:
+                rt.state.wrote_since_extract = True
         return report.message
 
     @filter.llm_tool(name="memory_search")
@@ -1007,6 +1375,7 @@ class MemoryBeyondPlugin(Star):
                 if state.summary
                 else 0
             ),
+            "recall": 0,
             "history": estimator.messages(contexts[mark:]),
         }
         return sum(parts.values()), parts
@@ -1060,6 +1429,7 @@ class MemoryBeyondPlugin(Star):
                 f" + 工具声明 {parts.get('tools', 0)}"
                 f" + 记忆索引 {parts.get('index', 0)}"
                 f" + 摘要 {parts.get('summary', 0)}"
+                f" + 召回 {parts.get('recall', 0)}"
                 f" + 历史原文 {parts.get('history', 0)}"
             )
         if state.last_actual > 0:
@@ -1081,7 +1451,7 @@ class MemoryBeyondPlugin(Star):
             f"（{global_part} / 会话 {len(session_files)} 个文件）",
             f"压缩：{'启用' if self._bool('enable_compression', True) else '停用'}",
             f"上下文窗口：{window if window > 0 else '未知'}（{window_note}）",
-            f"触发阈值：{self._threshold()}，压缩目标：{self._target_ratio()}",
+            f"触发阈值：{self._threshold():g}，压缩目标：{self._target_ratio():g}",
             f"水位线：{state.watermark}，摘要：{len(state.summary)} 字",
             *estimate_lines,
             "最近一次缓存命中："
@@ -1092,8 +1462,25 @@ class MemoryBeyondPlugin(Star):
             ),
             f"摘要提供商：{configured_id}",
             f"摘要链路：{cooldown}",
+            f"相关记忆召回：{self._recall_label()}",
+            f"后台记忆提取：{self._extract_label(state)}",
+            "记忆管理页：AstrBot WebUI 侧边栏「插件页面」",
         ]
         yield event.plain_result("\n".join(lines))
+
+    def _recall_label(self) -> str:
+        mode = self._str("recall_mode", "keyword").strip().lower()
+        limit = self._int("recall_max_files", recall.DEFAULT_MAX_FILES)
+        if mode == "off" or limit <= 0:
+            return "关闭"
+        name = "模型挑选" if mode == "llm" else "关键词匹配"
+        return f"{name}，每轮最多 {limit} 条"
+
+    def _extract_label(self, state: compress.SessionState) -> str:
+        interval = self._int("auto_extract_interval", 10)
+        if interval <= 0:
+            return "关闭"
+        return f"每 {interval} 轮一次（距上次 {state.turns_since_extract} 轮）"
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("mb_reset")
@@ -1118,7 +1505,7 @@ class MemoryBeyondPlugin(Star):
         """测试摘要模型回退链是否可用（配置提供商 → 当前对话提供商）。"""
         yield event.plain_result("正在测试摘要链路……")
         text, attempts_log = await self._call_summarizer(
-            event, "请只回复两个字符：OK"
+            str(event.unified_msg_origin), "请只回复两个字符：OK"
         )
         detail = "\n".join(attempts_log) if attempts_log else "（没有可尝试的提供商）"
         if text:
@@ -1129,4 +1516,13 @@ class MemoryBeyondPlugin(Star):
             )
 
     async def terminate(self):
-        """状态在每次变更时已即时落盘，无需额外清理。"""
+        """卸载/重载时：撤下 WebUI 接口、取消后台提取、登记簿落盘。
+
+        压缩状态与记忆在每次变更时已即时落盘。
+        """
+        self.dashboard.unregister()
+        for task in list(self._tasks):
+            task.cancel()
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+        await self._flush_registry()

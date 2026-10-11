@@ -115,3 +115,9 @@ def test_calibrate_converges_to_absolute_ratio():
 def test_scale_applies_ratio():
     assert tokens.TokenEstimator(1.5).scale(800) == 1200
     assert tokens.TokenEstimator(1.0).scale(800) == 800
+
+
+def test_estimate_messages_skips_platform_internal_records():
+    plain = [{"role": "user", "content": "hi"}]
+    with_checkpoint = plain + [{"role": "_checkpoint", "content": {"id": "ckpt-1"}}]
+    assert tokens.estimate_messages(with_checkpoint) == tokens.estimate_messages(plain)

@@ -29,7 +29,7 @@ import time
 from dataclasses import dataclass, field
 
 from . import tokens
-from .turns import Turn, split_leading_system, split_turns
+from .turns import Turn, is_internal_message, split_leading_system, split_turns
 
 # 内置压缩器阈值。本插件阈值必须低于它，内置压缩器的 should_compress()
 # 才会永远返回 False、自动退化为 no-op（同时留在下游当安全网）。
@@ -48,6 +48,11 @@ CLIP_MIN_CHARS = 200
 
 # 渲染摘要转写时单条消息的字符上限（丢弃完整工具输出，保留头部语义）。
 TRANSCRIPT_MSG_CHARS = 2000
+# 估算分项的键（顺序即 mb_status / WebUI 的展示顺序）
+PART_KEYS = ("overhead", "tools", "index", "summary", "recall", "history")
+# 清理旧工具结果：短于这个长度的结果不值得清（占不了多少上下文）
+TOOL_RESULT_CLEAR_MIN_CHARS = 300
+TOOL_RESULT_CLEARED = "[较早的工具结果已清理以节省上下文；需要时可重新调用工具获取]"
 
 
 @dataclass
@@ -62,8 +67,8 @@ class SessionState:
     # 最近一次请求的 token 估算值。
     last_estimate: int = 0
     # 最近一次估算的分项构成：overhead（固定开销）/ tools（工具声明）/
-    # index（索引块）/ summary（摘要）/ history（历史原文），各项之和即
-    # last_estimate；空字典表示尚无记录（如旧版本升级来的状态文件）。
+    # index（索引块）/ summary（摘要）/ recall（召回块）/ history（历史原文），
+    # 各项之和即 last_estimate；空字典表示尚无记录（如旧版本升级来的状态文件）。
     last_parts: dict = field(default_factory=dict)
     # 最近一次提供商上报的真实 prompt_tokens；0 表示尚无记录。
     last_actual: int = 0
@@ -72,6 +77,12 @@ class SessionState:
     fail_count: int = 0
     fail_until: float = 0.0
     compressed_at: float = 0.0
+    # 后台定期提取：距上次提取经过的请求轮数、期间主模型是否自己写过记忆
+    turns_since_extract: int = 0
+    wrote_since_extract: bool = False
+    extracted_at: float = 0.0
+    # 最近一次请求的时间，判断提示词缓存是否已经冷掉（清理旧工具结果用）
+    last_request_at: float = 0.0
 
     def to_dict(self) -> dict:
         return {
@@ -87,6 +98,10 @@ class SessionState:
             "fail_count": self.fail_count,
             "fail_until": self.fail_until,
             "compressed_at": self.compressed_at,
+            "turns_since_extract": self.turns_since_extract,
+            "wrote_since_extract": self.wrote_since_extract,
+            "extracted_at": self.extracted_at,
+            "last_request_at": self.last_request_at,
         }
 
     @classmethod
@@ -106,6 +121,10 @@ class SessionState:
             state.fail_count = max(0, int(raw.get("fail_count", 0)))
             state.fail_until = float(raw.get("fail_until", 0.0))
             state.compressed_at = float(raw.get("compressed_at", 0.0))
+            state.turns_since_extract = max(0, int(raw.get("turns_since_extract", 0)))
+            state.wrote_since_extract = bool(raw.get("wrote_since_extract", False))
+            state.extracted_at = float(raw.get("extracted_at", 0.0))
+            state.last_request_at = float(raw.get("last_request_at", 0.0))
         except (TypeError, ValueError):
             return cls(cid=state.cid, summary=state.summary, anchor=state.anchor)
         if not math.isfinite(state.ratio) or state.ratio <= 0:
@@ -113,7 +132,7 @@ class SessionState:
         raw_parts = raw.get("last_parts")
         if isinstance(raw_parts, dict):
             parts: dict = {}
-            for key in ("overhead", "tools", "index", "summary", "history"):
+            for key in PART_KEYS:
                 try:
                     parts[key] = max(0, int(raw_parts.get(key, 0)))
                 except (TypeError, ValueError):
@@ -137,8 +156,9 @@ class SessionState:
     def record_failure(self, now: float | None = None) -> None:
         now = now if now is not None else time.time()
         self.fail_count += 1
+        # 指数封顶：摘要模型长期坏着时 2 ** n 会溢出成异常
         delay = min(
-            COOLDOWN_BASE_SECONDS * (2 ** (self.fail_count - 1)),
+            COOLDOWN_BASE_SECONDS * (2 ** min(self.fail_count - 1, 16)),
             COOLDOWN_MAX_SECONDS,
         )
         self.fail_until = now + delay
@@ -166,16 +186,41 @@ def fingerprint(message: dict) -> str:
     return hashlib.md5(payload.encode("utf-8")).hexdigest()[:16]
 
 
+ANCHOR_CHAIN_PREFIX = "chain:"
+
+
+def anchor_for(contexts: list[dict], watermark: int) -> str:
+    """水位线锚点：被摘要吞掉的整段历史（开头 system 除外）的指纹链。
+
+    只认水位线前一条消息的话，平台回存裁剪后若恰好有一条内容相同的消息落在
+    同一位置（"好的"这类短回复、同一文件的两次读取结果），就会误判为历史没变，
+    把尚未进摘要的消息从视图里丢掉；整段指纹链不会这样撞上。
+    """
+    start = split_leading_system(contexts)
+    chain = "\n".join(
+        fingerprint(m) for m in contexts[start:watermark] if isinstance(m, dict)
+    )
+    digest = hashlib.md5(chain.encode("utf-8")).hexdigest()[:16]
+    return ANCHOR_CHAIN_PREFIX + digest
+
+
+def anchor_matches(state: SessionState, contexts: list[dict]) -> bool:
+    """水位线是否仍指向同一段历史（兼容旧版状态文件里的单条消息锚点）。"""
+    if state.watermark <= 0 or state.watermark > len(contexts):
+        return False
+    if state.anchor.startswith(ANCHOR_CHAIN_PREFIX):
+        return anchor_for(contexts, state.watermark) == state.anchor
+    anchor_msg = contexts[state.watermark - 1]
+    return isinstance(anchor_msg, dict) and fingerprint(anchor_msg) == state.anchor
+
+
 def state_matches(state: SessionState, cid: str, contexts: list[dict]) -> bool:
     """状态是否仍适用于当前历史：对话没换、水位线没越界、锚点对得上。"""
     if state.cid != cid:
         return False
     if state.watermark <= 0:
         return True
-    if state.watermark > len(contexts):
-        return False
-    anchor_msg = contexts[state.watermark - 1]
-    return isinstance(anchor_msg, dict) and fingerprint(anchor_msg) == state.anchor
+    return anchor_matches(state, contexts)
 
 
 RECONCILE_MATCH = "match"
@@ -203,10 +248,8 @@ def reconcile(state: SessionState, cid: str, contexts: list[dict]) -> str:
         return RECONCILE_MATCH
     if state.watermark <= 0:
         return RECONCILE_MATCH
-    if state.watermark <= len(contexts):
-        anchor_msg = contexts[state.watermark - 1]
-        if isinstance(anchor_msg, dict) and fingerprint(anchor_msg) == state.anchor:
-            return RECONCILE_MATCH
+    if anchor_matches(state, contexts):
+        return RECONCILE_MATCH
     if state.summary:
         state.watermark = 0
         state.anchor = ""
@@ -284,7 +327,7 @@ def apply_summary(
     """摘要成功后推进水位线并记录锚点指纹。"""
     state.summary = summary.strip()
     state.watermark = plan.new_watermark
-    state.anchor = fingerprint(contexts[plan.new_watermark - 1])
+    state.anchor = anchor_for(contexts, plan.new_watermark)
     state.compressed_at = time.time()
     state.record_success()
 
@@ -370,6 +413,37 @@ def last_round_used_tools(contexts: list[dict]) -> bool:
     return False
 
 
+def clear_old_tool_results(
+    tail: list[dict], keep_recent_turns: int
+) -> tuple[list[dict], int]:
+    """把最近 keep_recent_turns 轮之前的长工具结果换成一行占位文字。
+
+    只在提示词缓存已经冷掉时调用（长时间没有新请求）：这时整段前缀反正
+    要重新计费，顺手卸掉旧工具输出最划算；缓存热的时候改动历史中段只会
+    让缓存失效。tool_call 与 tool 结果的配对结构保持不变，只换 content。
+    返回 (新的消息列表, 清理条数)；被清的内容随平台回存历史一并卸下。
+    """
+    turns = split_turns(tail)
+    keep = max(1, keep_recent_turns)
+    if len(turns) <= keep:
+        return tail, 0
+    boundary = turns[len(turns) - keep].start
+    result: list[dict] = []
+    cleared = 0
+    for index, message in enumerate(tail):
+        if (
+            index < boundary
+            and isinstance(message, dict)
+            and message.get("role") == "tool"
+            and message.get("content") != TOOL_RESULT_CLEARED
+            and len(_content_to_text(message.get("content"))) >= TOOL_RESULT_CLEAR_MIN_CHARS
+        ):
+            message = {**message, "content": TOOL_RESULT_CLEARED}
+            cleared += 1
+        result.append(message)
+    return result, cleared
+
+
 # ---------------------------------------------------------------- 转写渲染
 
 
@@ -397,6 +471,8 @@ def render_transcript(messages: list[dict]) -> str:
     """把待摘要的消息渲染成转写文本；完整工具输出被截断（摘要本就该丢弃它们）。"""
     lines: list[str] = []
     for message in messages:
+        if not isinstance(message, dict) or is_internal_message(message):
+            continue
         role = message.get("role", "")
         text = _content_to_text(message.get("content")).strip()
         if len(text) > TRANSCRIPT_MSG_CHARS:
@@ -418,3 +494,8 @@ def render_transcript(messages: list[dict]) -> str:
         else:
             lines.append(f"{role}：{text}")
     return "\n".join(lines)
+
+
+def content_to_text(content) -> str:
+    """消息 content（字符串或多段列表）转成纯文本，非文本段以 [类型] 占位。"""
+    return _content_to_text(content)

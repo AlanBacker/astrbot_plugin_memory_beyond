@@ -113,9 +113,61 @@ def test_apply_summary_advances_state():
     compress.apply_summary(state, contexts, plan, "  摘要内容  ")
     assert state.summary == "摘要内容"
     assert state.watermark == plan.new_watermark
-    assert state.anchor == fingerprint(contexts[plan.new_watermark - 1])
+    assert state.anchor == compress.anchor_for(contexts, plan.new_watermark)
+    assert state.anchor.startswith(compress.ANCHOR_CHAIN_PREFIX)
     assert state.fail_count == 0 and state.fail_until == 0.0
     assert state_matches(state, "c1", contexts)
+
+
+def test_anchor_chain_rejects_shifted_history_after_save_back():
+    # 5 轮历史，第 2 轮和第 4 轮的助手回复都是"好的。"
+    contexts = [{"role": "system", "content": "p"}]
+    for i in range(5):
+        contexts.append({"role": "user", "content": f"问{i}"})
+        contexts.append(
+            {"role": "assistant", "content": "好的。" if i in (1, 3) else f"答{i}"}
+        )
+    state = SessionState(cid="c1")
+    plan = plan_compression(contexts, 0, 3)
+    assert plan.new_watermark == 5
+    compress.apply_summary(state, contexts, plan, "摘要")
+    assert state_matches(state, "c1", contexts)
+    # 平台回存压缩视图（system + 水位线之后的原文）再加新一轮：
+    # 原水位线位置上恰好又是一条"好的。"，单条指纹会撞上
+    saved = (
+        contexts[:1]
+        + contexts[5:]
+        + [{"role": "user", "content": "问5"}, {"role": "assistant", "content": "答5"}]
+    )
+    assert fingerprint(saved[4]) == fingerprint(contexts[4])
+    assert not state_matches(state, "c1", saved)
+    assert compress.reconcile(state, "c1", saved) == compress.RECONCILE_COLLAPSED
+    assert state.watermark == 0 and state.summary == "摘要"
+
+
+def test_legacy_single_message_anchor_still_accepted():
+    contexts = _history()
+    state = SessionState(cid="c1", watermark=3, summary="s", anchor=fingerprint(contexts[2]))
+    assert compress.reconcile(state, "c1", contexts) == compress.RECONCILE_MATCH
+    assert state.watermark == 3
+
+
+def test_record_failure_never_overflows():
+    state = SessionState(fail_count=5000)
+    state.record_failure(now=1000.0)
+    assert state.fail_until == 1000.0 + COOLDOWN_MAX_SECONDS
+
+
+def test_render_transcript_skips_internal_records():
+    text = compress.render_transcript(
+        [
+            {"role": "user", "content": "你好"},
+            {"role": "assistant", "content": "你好呀"},
+            {"role": "_checkpoint", "content": {"id": "ckpt-1"}},
+            "junk",
+        ]
+    )
+    assert text.splitlines() == ["用户：你好", "助手：你好呀"]
 
 
 # ---------------------------------------------------------------- 失败退避
@@ -293,6 +345,7 @@ def test_last_parts_roundtrip():
         "tools": 5,
         "index": 10,
         "summary": 20,
+        "recall": 7,
         "history": 10,
     }
     restored = SessionState.from_dict(state.to_dict())
@@ -311,6 +364,7 @@ def test_last_parts_tolerates_garbage():
         "tools": 0,
         "index": 0,
         "summary": 3,
+        "recall": 0,
         "history": 0,
     }
     raw["last_parts"] = "not a dict"
@@ -372,3 +426,60 @@ def test_plan_compression_keep_one_when_history_short():
     assert plan is not None
     assert plan.new_watermark == 3  # 最后一轮 user 的下标
     assert [m["content"] for m in plan.to_summarize] == ["persona", "q0", "a0"]
+
+
+# ---------------------------------------------------------------- 新增状态字段
+
+
+def test_new_state_fields_roundtrip_and_defaults():
+    state = SessionState(
+        cid="c1",
+        cache_hit_tokens=1200,
+        compressed_at=10.0,
+        turns_since_extract=4,
+        wrote_since_extract=True,
+        extracted_at=20.0,
+        last_request_at=30.0,
+    )
+    assert SessionState.from_dict(state.to_dict()) == state
+    old = SessionState.from_dict({"cid": "c1"})  # 旧版本状态文件
+    assert old.cache_hit_tokens == -1
+    assert old.turns_since_extract == 0
+    assert old.wrote_since_extract is False
+    assert old.last_request_at == 0.0
+    assert SessionState.from_dict({"turns_since_extract": -3}).turns_since_extract == 0
+
+
+# ---------------------------------------------------------------- 空闲清理旧工具结果
+
+
+def _tool_round(i, size):
+    return [
+        {"role": "user", "content": f"q{i}"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": f"t{i}", "type": "function", "function": {"name": "f", "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": f"t{i}", "content": "r" * size},
+        {"role": "assistant", "content": f"a{i}"},
+    ]
+
+
+def test_clear_old_tool_results_only_before_recent_turns():
+    tail = _tool_round(0, 500) + _tool_round(1, 50) + _tool_round(2, 500) + _tool_round(3, 500)
+    result, cleared = compress.clear_old_tool_results(tail, keep_recent_turns=2)
+    assert cleared == 1  # 第 0 轮的长结果；第 1 轮太短，第 2、3 轮在保留范围内
+    assert result[2]["content"] == compress.TOOL_RESULT_CLEARED
+    assert result[2]["tool_call_id"] == "t0"  # 配对结构不变
+    assert result[6]["content"] == "r" * 50
+    assert result[10]["content"] == "r" * 500
+    assert tail[2]["content"] == "r" * 500  # 不改原列表
+    again, cleared_again = compress.clear_old_tool_results(result, keep_recent_turns=2)
+    assert cleared_again == 0 and again == result
+
+
+def test_clear_old_tool_results_short_history_untouched():
+    tail = _tool_round(0, 500)
+    result, cleared = compress.clear_old_tool_results(tail, keep_recent_turns=3)
+    assert cleared == 0 and result is tail
