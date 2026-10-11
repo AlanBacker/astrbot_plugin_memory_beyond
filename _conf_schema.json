@@ -2,13 +2,19 @@
   "enable_memory": {
     "description": "启用长期记忆",
     "type": "bool",
-    "hint": "注入记忆索引并向 LLM 提供 memory_read / memory_write / memory_search 工具。关闭后已存记忆保留在磁盘，仅停止注入与读写。",
+    "hint": "注入记忆索引并向 LLM 提供 memory_read / memory_write / memory_edit / memory_search 工具。关闭后已存记忆保留在磁盘，仅停止注入与读写。",
     "default": true
   },
   "enable_global_memory": {
     "description": "启用全局记忆（跨会话共享的机器人自我记忆）",
     "type": "bool",
     "hint": "全局记忆存机器人自身的行为准则与偏好，写入后对所有群聊和私聊生效。默认关闭：机器人只读写当前会话的记忆，任何会话都影响不到它在其他会话的表现。开启前请想清楚：任何会话里的对话都可能促使机器人写入全局记忆，从而改变它在全部会话中的行为。关闭后已有的全局记忆文件保留在磁盘，仅停止注入与读写。",
+    "default": false
+  },
+  "enable_people_memory": {
+    "description": "启用人物记忆（同一平台所有会话共享的「这个人是谁」）",
+    "type": "bool",
+    "hint": "开启后，机器人为每个人保留一份跨会话的记忆文件（people/<平台>/user-<数字ID>.md），只记本人亲口说的、换个群也成立的事：身份、职业与专长、常用称呼、长期偏好；他在某个群里的角色和群内的事仍只记在那个会话里。好处是同一个人换个群、改私聊，机器人也认得他。代价是他在 A 群说的关于自己的事，机器人在 B 群也可能用到。默认关闭：每个会话各记各的，互不相通。关闭后已有的人物文件保留在磁盘，仅停止注入与读写。",
     "default": false
   },
   "annotate_sender": {

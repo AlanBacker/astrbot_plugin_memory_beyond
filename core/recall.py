@@ -97,9 +97,13 @@ def identity_files(
     return [f"user-{uid}.md" for uid in ids]
 
 
+# 身份必选只认这两个作用域：全局作用域不该有 user-<ID> 文件
+FORCED_SCOPES = ("session", "people")
+
+
 @dataclass
 class Candidate:
-    """一个可召回的记忆：作用域标签（global / session）+ 头信息。"""
+    """一个可召回的记忆：作用域标签（global / session / people）+ 头信息。"""
 
     scope: str
     header: MemoryHeader
@@ -115,7 +119,11 @@ def select_by_keywords(
     forced_files: list[str],
     limit: int = DEFAULT_MAX_FILES,
 ) -> list[Candidate]:
-    """身份必选在前，其余按关键词得分（同分取较新）补足到 limit 条。"""
+    """身份必选在前，其余按关键词得分（同分取较新）补足到 limit 条。
+
+    人物作用域（people）只参与身份必选：正在说话、被提到的人才带上，
+    不按关键词把别的群里的人扩散进来。
+    """
     if limit <= 0:
         return []
     chosen: list[Candidate] = []
@@ -124,20 +132,51 @@ def select_by_keywords(
         by_file.setdefault(cand.header.file, []).append(cand)
     for name in forced_files:
         for cand in by_file.get(name, []):
-            # 记人只在会话作用域；全局作用域不该有 user-<ID> 文件，也不强选
-            if cand.scope == "session" and cand not in chosen:
+            if cand.scope in FORCED_SCOPES and cand not in chosen:
                 chosen.append(cand)
     query_tokens = tokenize(query)
     scored = []
     for cand in candidates:
-        if cand in chosen:
+        if cand in chosen or cand.scope == "people":
             continue
         value = score(query_tokens, cand.header)
         if value >= MIN_SCORE:
-            scored.append((value, cand.header.mtime, cand))
+            scored.append((value, cand.header.updated, cand))
     scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
     chosen.extend(cand for _, _, cand in scored)
     return chosen[:limit]
+
+
+# ---------------------------------------------------------------- 写入查重
+
+# 新建文件时提示"可能重复"的门槛：描述三处重合，或两处重合加正文两处
+DUP_MIN_SCORE = 8
+_USER_FILE_RE = re.compile(r"^user-[^/]+\.md$")
+
+
+def similar_memories(
+    text: str, headers: list[MemoryHeader], exclude: str, limit: int = 2
+) -> list[MemoryHeader]:
+    """用召回同一套打分找出与新内容最像的已有记忆，供写入回执提示查重。
+
+    两个记人文件（user-<ID>.md）ID 不同就是两个人，不算重复——同一个
+    群里同行、同好的人很多，描述相近是常态。
+    """
+    tokens = tokenize(text)
+    if not tokens:
+        return []
+    is_user = bool(_USER_FILE_RE.match(exclude))
+    scored = []
+    for header in headers:
+        if header.file == exclude:
+            continue
+        if is_user and _USER_FILE_RE.match(header.file):
+            continue
+        value = score(tokens, header)
+        if value >= DUP_MIN_SCORE:
+            scored.append((value, header.updated, header))
+    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [header for _, _, header in scored[:limit]]
 
 
 # ---------------------------------------------------------------- 模型挑选
@@ -178,7 +217,7 @@ def build_selector_prompt(
         description = header.description or "（无描述）"
         lines.append(
             f"{i}. {cand.ref}｜{header.type or '未标注'}｜"
-            f"{age_label(header.mtime, now)}｜{description}"
+            f"{age_label(header.updated, now)}｜{description}"
         )
     return SELECTOR_PROMPT.format(
         limit=limit, manifest="\n".join(lines), query=(query or "").strip()[:2000]
@@ -221,12 +260,13 @@ def parse_selector_response(
 class Recalled:
     ref: str
     content: str
-    mtime: float
+    # 最近修改时间（frontmatter 的 updated 戳，缺省退回 mtime）
+    written: float
 
 
-def freshness_note(mtime: float, now: float | None = None) -> str:
+def freshness_note(written: float, now: float | None = None) -> str:
     """超过一天的记忆附上时效提醒；今天、昨天写的不打扰。"""
-    days = age_days(mtime, now)
+    days = age_days(written, now)
     if days <= 1:
         return ""
     return (
@@ -248,8 +288,8 @@ def build_recall_block(
         if sections and used + len(content) > TOTAL_CHARS:
             break
         used += len(content)
-        title = f"### {item.ref}（{age_label(item.mtime, now)}写入）"
-        note = freshness_note(item.mtime, now)
+        title = f"### {item.ref}（{age_label(item.written, now)}写入）"
+        note = freshness_note(item.written, now)
         sections.append("\n".join(part for part in (title, note, content) if part))
     if not sections:
         return None

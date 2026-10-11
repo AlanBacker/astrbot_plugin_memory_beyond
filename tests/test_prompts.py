@@ -44,13 +44,62 @@ def test_memory_guidance_scope_variants():
     full = prompts.memory_guidance(True)
     assert "两个作用域" in full and "- global：" in full
     assert "global 绝不存放关于具体用户或群的信息" in full
+    assert "人物记忆（people 作用域）已在插件配置中停用" in full
     session_only = prompts.memory_guidance(False)
     assert "两个作用域" not in session_only
     assert "scope 一律填 session" in session_only
     assert "global 绝不存放" not in session_only
+    assert "不要读写 global 或 people 作用域" in session_only
     # 作用域段之外的规范两个版本逐字一致
     assert session_only[:600] == full[:600]
     assert "记人规范（必须遵守）" in session_only
+
+
+def test_memory_guidance_people_variants():
+    both = prompts.memory_guidance(True, True)
+    assert "三个作用域" in both and "- global：" in both and "- people：" in both
+    assert "已在插件配置中停用" not in both
+    assert both.endswith("也不替别人代写。")
+    people_only = prompts.memory_guidance(False, True)
+    assert "两个作用域" in people_only and "- people：" in people_only
+    assert "- global：" not in people_only
+    assert "全局记忆（global 作用域）已在插件配置中停用" in people_only
+    assert "global 绝不存放" not in people_only
+    assert "people 只存本人亲口说的" in people_only
+    assert people_only[:600] == both[:600]
+
+
+def test_extract_rules_scope_only_with_people():
+    assert '"scope"' not in prompts.extract_rules(False)
+    assert prompts.extract_rules(True).startswith(prompts.EXTRACT_RULES)
+    assert "scope 填 people" in prompts.extract_rules(True)
+    assert "scope 填 people" in prompts.build_background_extract_prompt("t", "", True)
+    assert "scope 填 people" not in prompts.build_background_extract_prompt("t", "")
+    assert "scope 填 people" in build_summary_prompt("", "", "t", True, include_people=True)
+    assert "scope 填 people" not in build_summary_prompt("", "", "t", True)
+
+
+def test_parse_memories_scope_people_only_when_allowed():
+    entries = [
+        {"type": "user", "name": "user-1", "description": "d", "content": "c", "scope": "people"},
+        {"type": "project", "name": "p", "description": "d", "content": "c", "scope": "people"},
+        {"type": "user", "name": "user-ajie", "description": "d", "content": "c", "scope": "PEOPLE"},
+        {"type": "user", "name": "user-2", "description": "d", "content": "c", "scope": "global"},
+    ]
+    text = f"<memories>{json.dumps(entries, ensure_ascii=False)}</memories>"
+    assert [d.scope for d in prompts.parse_memories(text)] == ["session"] * 4
+    allowed = prompts.parse_memories(text, allow_people=True)
+    assert [d.scope for d in allowed] == ["people", "session", "session", "session"]
+    _, drafts = parse_summary_response(f"<summary>s</summary>{text}", allow_people=True)
+    assert drafts[0].scope == "people"
+
+
+def test_build_existing_section_notes_people_files():
+    full = [prompts.ExistingMemory("people/user-1.md", "阿杰", "---\nname: user-1\n---\n正文")]
+    section = prompts.build_existing_section(full, [])
+    assert "=== people/user-1.md ===" in section and "scope 填 people" in section
+    plain = prompts.build_existing_section([prompts.ExistingMemory("user-1.md", "a", "b")], [])
+    assert "scope 填 people" not in plain
 
 
 def test_summary_message_is_data_not_instruction():
@@ -357,3 +406,14 @@ def test_background_extract_prompt_fills_placeholders():
 
 def test_data_notice_is_public():
     assert prompts.DATA_NOTICE
+
+
+def test_parse_memories_reads_source_ids():
+    entries = [
+        {"type": "user", "name": "user-1", "description": "d", "content": "c", "source": "111, 222，111"},
+        {"type": "project", "name": "p", "description": "d", "content": "c"},
+    ]
+    drafts = prompts.parse_memories(f"<memories>{json.dumps(entries, ensure_ascii=False)}</memories>")
+    assert drafts[0].source == "111, 222" and drafts[1].source == ""
+    assert "metadata:\n  type: user\n  source: 111, 222\n---" in render_memory_file(drafts[0])
+    assert "source" not in render_memory_file(drafts[1])

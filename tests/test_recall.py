@@ -68,6 +68,19 @@ def test_select_by_keywords_never_forces_global_user_files():
     assert recall.select_by_keywords(cands, "", ["user-123456.md"], 5) == []
 
 
+def test_select_by_keywords_people_only_by_identity():
+    cands = [
+        cand("user-123456.md", "阿杰，开黑常客", scope="people"),
+        cand("user-654321.md", "小鱼，也爱开黑", scope="people"),
+        cand("project-game.md", "每周六晚上的开黑活动"),
+    ]
+    chosen = recall.select_by_keywords(cands, "这周六还开黑吗", ["user-123456.md"], 5)
+    assert [(c.scope, c.header.file) for c in chosen] == [
+        ("people", "user-123456.md"),
+        ("session", "project-game.md"),
+    ]
+
+
 def test_select_by_keywords_respects_limit_and_prefers_newer_on_tie():
     old = cand("a.md", "开黑活动安排", mtime=NOW - 10 * DAY)
     new = cand("b.md", "开黑活动安排", mtime=NOW)
@@ -107,6 +120,21 @@ def test_parse_selector_response_accepts_refs_and_bare_names():
 
 
 # ---------------------------------------------------------------- 注入块
+
+
+def test_similar_memories_flags_same_topic_but_not_other_people():
+    heads = [
+        header("weekend-game.md", "周六晚上开黑活动安排", "每周六晚上八点固定开黑"),
+        header("user-2.md", "李四，群管理，前端工程师", "常加班"),
+        header("deadline.md", "项目截止日", "2026-08-15"),
+    ]
+    hits = recall.similar_memories("每周六晚八点开黑 周六晚上八点集合开黑", heads, "project-game.md")
+    assert [h.file for h in hits] == ["weekend-game.md"]
+    # 两个记人文件 ID 不同就是两个人，描述再像也不提示
+    assert recall.similar_memories("张三，群主，前端工程师，常加班", heads, "user-1.md") == []
+    # 不是记人文件就照常比
+    assert [h.file for h in recall.similar_memories("群管理前端工程师常加班", heads, "note.md")] == ["user-2.md"]
+    assert recall.similar_memories("", heads, "x.md") == []
 
 
 def test_freshness_note_only_for_older_than_a_day():

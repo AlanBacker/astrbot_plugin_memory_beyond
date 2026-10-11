@@ -222,6 +222,11 @@ svg.icon {
   color: var(--t-reference);
 }
 
+.avatar.people {
+  background: var(--t-feedback-soft);
+  color: var(--t-feedback);
+}
+
 .session-text {
   min-width: 0;
   flex: 1;

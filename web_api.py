@@ -40,6 +40,8 @@ LOG_PREFIX = "[MemoryBeyond] "
 
 SCOPE_GLOBAL = "global"
 SCOPE_SESSION = "session"
+SCOPE_PEOPLE = "people"
+PEOPLE_FILE_RULE = "人物记忆一人一个文件，文件名必须是 user-<数字ID>.md"
 MAX_REMARK = 64
 MAX_QUERY = 200
 
@@ -92,6 +94,9 @@ def _header_dict(header: memstore.MemoryHeader) -> dict:
         "description": header.description,
         "type": header.type,
         "mtime": header.mtime,
+        "updated": header.updated,
+        "created": header.created,
+        "source": header.source,
         "size": header.size,
         "links": header.links,
     }
@@ -246,7 +251,13 @@ class MemoryDashboard:
             if store is None:
                 raise ApiError("会话标识不合法")
             return SCOPE_SESSION, session_key, store
-        raise ApiError("作用域只能是 global 或 session")
+        if scope == SCOPE_PEOPLE:
+            people_key = _text(key).strip()
+            store = self.plugin._store.people_scope_by_key(people_key)
+            if store is None:
+                raise ApiError("平台标识不合法")
+            return SCOPE_PEOPLE, people_key, store
+        raise ApiError("作用域只能是 global、session 或 people")
 
     def _scope_from_query(self):
         return self._scope(_query("scope"), _query("key"))
@@ -272,6 +283,8 @@ class MemoryDashboard:
     def _scope_label(self, scope: str, key: str | None) -> str:
         if scope == SCOPE_GLOBAL:
             return "机器人自我记忆（全局）"
+        if scope == SCOPE_PEOPLE:
+            return f"人物记忆（平台 {key}，一人一个文件）"
         record = self.plugin._registry.get(key or "")
         if record is not None and (record.remark or record.name):
             return record.remark or record.name
@@ -292,8 +305,11 @@ class MemoryDashboard:
             for key in keys
             if memstore.is_scope_key(key)
         }
+        people_scopes = {
+            key: store.people_scope_by_key(key) for key in store.people_keys()
+        }
 
-        def collect() -> tuple[dict, list[dict]]:
+        def collect() -> tuple[dict, list[dict], list[dict]]:
             g_count, g_latest = _scan_scope(global_scope)
             sessions = []
             for key, scope in scopes.items():
@@ -306,14 +322,21 @@ class MemoryDashboard:
                     hasState=plugin.state_path_for_key(key).is_file(),
                 )
                 sessions.append(item)
-            return {"fileCount": g_count, "updatedAt": g_latest}, sessions
+            platforms = []
+            for key, scope in people_scopes.items():
+                count, latest = _scan_scope(scope) if scope else (0, 0.0)
+                platforms.append(
+                    {"key": key, "platform": key, "fileCount": count, "updatedAt": latest}
+                )
+            return {"fileCount": g_count, "updatedAt": g_latest}, sessions, platforms
 
-        global_info, sessions = await asyncio.to_thread(collect)
+        global_info, sessions, platforms = await asyncio.to_thread(collect)
         global_info["enabled"] = plugin._global_on()
         return _ok(
             {
                 "memoryEnabled": plugin._bool("enable_memory", True),
                 "global": global_info,
+                "people": {"enabled": plugin._people_on(), "platforms": platforms},
                 "sessions": sessions,
             }
         )
@@ -351,6 +374,9 @@ class MemoryDashboard:
             data["archiveCount"] = await asyncio.to_thread(
                 self.plugin._archive.count, key
             )
+        elif scope == SCOPE_PEOPLE:
+            data["people"] = {"key": key, "platform": key}
+            data["enabled"] = self.plugin._people_on()
         else:
             data["enabled"] = self.plugin._global_on()
         return _ok(data)
@@ -371,6 +397,9 @@ class MemoryDashboard:
                 "description": doc.description,
                 "type": doc.type,
                 "body": doc.body,
+                "created": doc.created,
+                "updated": doc.updated,
+                "source": doc.source,
                 "hasFrontmatter": doc.has_frontmatter,
                 "links": memstore.extract_links(content),
             }
@@ -429,6 +458,8 @@ class MemoryDashboard:
         body = await _body()
         scope, key, store = self._scope_from_body(body)
         name = self._file_name(body.get("file"))
+        if scope == SCOPE_PEOPLE and not memstore.is_person_file(name):
+            raise ApiError(PEOPLE_FILE_RULE)
         old_raw = _text(body.get("oldFile")).strip()
         old = self._file_name(old_raw) if old_raw else ""
         renaming = bool(old) and old != name
@@ -439,6 +470,8 @@ class MemoryDashboard:
             mem_type = _text(body.get("type")).strip().lower()
             if mem_type not in memstore.MEMORY_TYPES:
                 raise ApiError("类型只能是 user、feedback、project、reference 之一")
+            if scope == SCOPE_PEOPLE and mem_type != "user":
+                raise ApiError("人物记忆的类型只能是 user")
             description = " ".join(_text(body.get("description")).split())
             if not description:
                 raise ApiError("请填写描述：它会成为索引里的那一行")

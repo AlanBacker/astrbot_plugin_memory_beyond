@@ -7,11 +7,15 @@
   "config": {
     "enable_memory": {
       "description": "Enable long-term memory",
-      "hint": "Adds the memory index to each conversation and gives the model the memory_read / memory_write / memory_search tools. When turned off, saved memories stay on disk; the bot just stops reading and writing them."
+      "hint": "Adds the memory index to each conversation and gives the model the memory_read / memory_write / memory_edit / memory_search tools. When turned off, saved memories stay on disk; the bot just stops reading and writing them."
     },
     "enable_global_memory": {
       "description": "Enable global memory (the bot's own memory, shared by all chats)",
       "hint": "Global memory holds the bot's own rules and preferences, and anything written there affects every group and private chat. Off by default: the bot only reads and writes the current chat's memory, so no chat can change how it behaves in other chats. Think before turning it on: a conversation in any chat could lead the bot to write global memory and change its behaviour everywhere. When turned off, existing global memory files stay on disk; the bot just stops reading and writing them."
+    },
+    "enable_people_memory": {
+      "description": "Enable people memory (who a person is, shared by every chat on the same platform)",
+      "hint": "When on, the bot keeps one cross-chat memory file per person (people/<platform>/user-<ID>.md) holding only what that person said about themselves and what stays true in any chat: identity, job and skills, how they like to be addressed, long-term preferences. Their role and doings in a particular group stay in that chat's memory. The upside: the bot recognises the same person in another group or in private chat. The cost: what they said about themselves in group A may be used by the bot in group B. Off by default: every chat keeps its own notes. When turned off, existing people files stay on disk; the bot just stops reading and writing them."
     },
     "annotate_sender": {
       "description": "Label each user message with the sender",
@@ -102,6 +106,11 @@
       "selfMemory": "The bot itself",
       "globalTitle": "Global memory",
       "globalSub": "Shared by all chats",
+      "peopleLabel": "People",
+      "peopleTitle": "People · {platform}",
+      "peopleSub": "Shared by every chat on this platform, one file per person",
+      "peopleNone": "No people memory yet: once the bot notes someone, their platform shows up here",
+      "peopleOffNotice": "People memory is not enabled: the bot will not read or write anything here. To use it, turn on \"Enable people memory\" in the plugin settings.",
       "fileCount": "{n} memories",
       "sessionsLabel": "Chats · {n}",
       "noSessions": "No matching chats",
@@ -167,6 +176,8 @@
       "linkMissing": "This memory does not exist",
       "newHint": "A new memory shows up in the index from the next conversation or the next compression",
       "savedAt": "Last written: {time}",
+      "stampLine": "Created {created} · Updated {updated}",
+      "sourceLine": "Source ID {ids}",
       "delete": "Delete",
       "cancel": "Cancel",
       "save": "Save",

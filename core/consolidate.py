@@ -96,7 +96,7 @@ def build_prompt(
             continue
         used += len(content)
         blocks.append(
-            f"=== {header.file}（{age_label(header.mtime, now)}写入）===\n{content.strip()}"
+            f"=== {header.file}（{age_label(header.updated, now)}写入）===\n{content.strip()}"
         )
     prompt = CONSOLIDATE_PROMPT.format(
         scope_label=scope_label, files="\n\n".join(blocks) or "（空）"

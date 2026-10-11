@@ -1,4 +1,5 @@
 import asyncio
+import time
 
 from core import memstore
 from core.memstore import (
@@ -98,7 +99,10 @@ def test_write_read_delete_syncs_index(tmp_path):
     content = memory_md("fact", "项目截止日是 2026-08-15")
     report = run(store.write("fact.md", content))
     assert report.ok and "索引行已同步" in report.message
-    assert run(store.read("fact.md")) == content
+    saved = memstore.parse_memory(run(store.read("fact.md")))
+    assert saved.body == "正文。" and saved.description == "项目截止日是 2026-08-15"
+    # 写入时自动补上 created / updated 戳
+    assert saved.created and saved.updated == saved.created
     assert store.list_files() == ["fact.md"]  # 不含 MEMORY.md
     assert (
         run(store.read(INDEX_FILENAME))
@@ -193,6 +197,140 @@ def test_write_rejects_oversize(tmp_path):
 def test_delete_missing_file(tmp_path):
     store = ScopeStore(tmp_path)
     assert not run(store.delete("nope.md")).ok
+
+
+# ---------------------------------------------------------------- 局部编辑
+
+
+def test_edit_replaces_once_and_syncs_index(tmp_path):
+    store = ScopeStore(tmp_path)
+    run(store.write("a.md", memory_md("a", "旧钩子", "喜欢周六开黑。")))
+    report = run(store.edit("a.md", "旧钩子", "新钩子"))
+    assert report.ok and "替换 1 处" in report.message
+    assert "description: 新钩子" in run(store.read("a.md"))
+    assert run(store.read(INDEX_FILENAME)) == "- [a](a.md) — 新钩子\n"
+    # 正文局部改动，frontmatter 与其余正文原样
+    assert run(store.edit("a.md", "周六", "周日")).ok
+    doc = memstore.parse_memory(run(store.read("a.md")))
+    assert doc.description == "新钩子" and doc.body == "喜欢周日开黑。"
+
+
+def test_edit_requires_unique_match_unless_replace_all(tmp_path):
+    store = ScopeStore(tmp_path)
+    run(store.write("a.md", memory_md("a", "钩", "甲 乙 甲")))
+    report = run(store.edit("a.md", "甲", "丙"))
+    assert not report.ok and "2 处" in report.message
+    assert "甲 乙 甲" in run(store.read("a.md"))
+    report = run(store.edit("a.md", "甲", "丙", replace_all=True))
+    assert report.ok and "替换 2 处" in report.message
+    assert "丙 乙 丙" in run(store.read("a.md"))
+
+
+def test_edit_rejects_bad_input(tmp_path):
+    store = ScopeStore(tmp_path)
+    run(store.write("a.md", memory_md("a", "钩", "正文")))
+    whole = run(store.read("a.md"))
+    assert "没有找到" in run(store.edit("a.md", "不存在的片段", "x")).message
+    assert not run(store.edit("a.md", "", "x")).ok
+    assert not run(store.edit("a.md", "正文", "正文")).ok
+    assert "memory_write" in run(store.edit("nope.md", "a", "b")).message
+    assert not run(store.edit("../a.md", "a", "b")).ok
+    assert not run(store.edit(INDEX_FILENAME, "a", "b")).ok
+    # 改完文件就空了：拒绝，提示走删除
+    report = run(store.edit("a.md", whole, ""))
+    assert not report.ok and "delete=true" in report.message
+    assert run(store.read("a.md")) == whole
+
+
+# ---------------------------------------------------------------- 时间与来源戳
+
+
+def _ts(text: str) -> float:
+    return time.mktime(time.strptime(text, "%Y-%m-%d %H:%M"))
+
+
+def test_write_stamps_created_updated_and_source(tmp_path):
+    store = ScopeStore(tmp_path)
+    run(store.write("a.md", memory_md("a", "钩"), source="111"))
+    doc = memstore.parse_memory(run(store.read("a.md")))
+    assert memstore.parse_stamp(doc.created) is not None
+    assert doc.updated == doc.created and doc.source == "111"
+    # 改写：created 保留，内容里没写的戳从旧文件继承，再并入新来源
+    run(store.write("a.md", memory_md("a", "新钩"), source="222"))
+    doc2 = memstore.parse_memory(run(store.read("a.md")))
+    assert doc2.created == doc.created and doc2.source == "111, 222"
+    assert doc2.description == "新钩"
+    # 局部编辑同样补戳
+    run(store.edit("a.md", "正文。", "正文二。", source="333"))
+    doc3 = memstore.parse_memory(run(store.read("a.md")))
+    assert doc3.created == doc.created and doc3.source == "111, 222, 333"
+    assert doc3.body == "正文二。"
+
+
+def test_stamp_memory_keeps_everything_else():
+    now = _ts("2026-10-11 18:30")
+    raw = (
+        "---\nname: a\ndescription: >-\n  两行\n  描述\nmetadata:\n  type: user\n"
+        "  note: 保留\n\ntags: x\n---\n\n正文 [[b]]\n"
+    )
+    out = memstore.stamp_memory(raw, now, "111")
+    assert out == (
+        "---\nname: a\ndescription: >-\n  两行\n  描述\nmetadata:\n  type: user\n"
+        "  note: 保留\n  created: 2026-10-11 18:30\n  updated: 2026-10-11 18:30\n"
+        "  source: 111\n\ntags: x\n---\n\n正文 [[b]]\n"
+    )
+    # 再盖一次：同名戳行替换而不是重复；created 不变、updated 更新、来源并入
+    again = memstore.stamp_memory(out, now + 3600, "222", previous=out)
+    assert again.count("created:") == 1 and again.count("updated:") == 1
+    assert "  created: 2026-10-11 18:30\n  updated: 2026-10-11 19:30\n  source: 111, 222\n" in again
+    # 没有 metadata 块就补一个；没有 frontmatter 原样返回
+    assert "metadata:\n  created:" in memstore.stamp_memory("---\nname: a\n---\n正文\n", now)
+    assert memstore.stamp_memory("# 无 frontmatter\n", now) == "# 无 frontmatter\n"
+    # 旧文件的 created 优先于内容里写的；写坏的戳不采用
+    bad = raw.replace("  type: user\n", "  type: user\n  created: 昨天\n")
+    newer = memstore.stamp_memory(bad, now + 3600, previous=out)
+    assert "  created: 2026-10-11 18:30\n" in newer and "昨天" not in newer
+    assert "  created: 2026-10-11 19:30\n" in memstore.stamp_memory(bad, now + 3600)
+
+
+def test_parse_stamp_and_sources():
+    assert memstore.parse_stamp("2026-10-11 18:30") == _ts("2026-10-11 18:30")
+    assert memstore.parse_stamp("2026-10-11") is not None
+    assert memstore.parse_stamp("昨天") is None and memstore.parse_stamp("") is None
+    assert memstore.split_sources("111, 222，333 111") == ["111", "222", "333"]
+    assert memstore.merge_sources("1, 2, 3, 4, 5", "6") == "2, 3, 4, 5, 6"
+    assert memstore.merge_sources("", "") == ""
+
+
+def test_headers_use_updated_stamp(tmp_path):
+    store = ScopeStore(tmp_path)
+    old = (
+        "---\nname: a\ndescription: 钩\nmetadata:\n  type: user\n"
+        "  created: 2026-01-01 08:00\n  updated: 2026-01-02 09:00\n  source: 111\n---\n\n正文\n"
+    )
+    (tmp_path / "a.md").write_text(old, encoding="utf-8")
+    (tmp_path / "b.md").write_text(memory_md("b", "钩"), encoding="utf-8")
+    heads = {h.file: h for h in store.headers()}
+    assert heads["a.md"].updated == _ts("2026-01-02 09:00")
+    assert heads["a.md"].created == _ts("2026-01-01 08:00")
+    assert heads["a.md"].source == "111"
+    assert heads["b.md"].updated == heads["b.md"].mtime and heads["b.md"].created == 0.0
+
+
+def test_compose_memory_with_stamps():
+    text = memstore.compose_memory("a", "d", "user", "正文", created="2026-01-01 08:00", source="111")
+    assert "metadata:\n  type: user\n  created: 2026-01-01 08:00\n  source: 111\n---" in text
+    assert "updated" not in text
+
+
+def test_edit_accepts_crlf_fragment_and_guards_size(tmp_path):
+    store = ScopeStore(tmp_path)
+    run(store.write("a.md", memory_md("a", "钩", "第一行\n第二行")))
+    report = run(store.edit("a.md", "第一行\r\n第二行", "合并行"))
+    assert report.ok and "合并行" in run(store.read("a.md"))
+    report = run(store.edit("a.md", "合并行", "x" * memstore.MAX_FILE_BYTES))
+    assert not report.ok and "上限" in report.message
+    assert "合并行" in run(store.read("a.md"))
 
 
 # ---------------------------------------------------------------- 索引体积守门
@@ -423,3 +561,20 @@ def test_session_keys_and_scope_by_key(tmp_path):
     assert store.session_scope_by_key("") is None
     assert memstore.is_scope_key(key)
     assert not memstore.is_scope_key("a/b")
+
+
+def test_people_scope_per_platform(tmp_path):
+    store = MemoryStore(tmp_path)
+    assert store.people_keys() == []
+    p = store.people_scope("aiocqhttp")
+    run(p.write("user-1.md", "x"))
+    assert (tmp_path / "people" / "aiocqhttp" / "user-1.md").is_file()
+    assert store.people_keys() == ["aiocqhttp"]
+    assert store.people_scope_by_key("aiocqhttp") is p
+    assert store.people_scope_by_key("../x") is None
+    assert store.people_scope("") is store.people_scope("unknown")
+    assert store.people_scope("a") is not store.session_scope("a")
+    assert memstore.is_person_file("user-12345678.md")
+    assert not memstore.is_person_file("user-ajie.md")
+    assert not memstore.is_person_file("project-x.md")
+    assert not memstore.is_person_file("")

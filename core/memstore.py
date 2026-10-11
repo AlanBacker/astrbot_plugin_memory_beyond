@@ -26,6 +26,7 @@ import os
 import re
 import shutil
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -43,6 +44,15 @@ MAX_HOOK_CHARS = 100
 # 召回打分只看文件开头这么多字符，避免个别大文件拖慢每轮的扫描
 HEADER_TEXT_CHARS = 8 * 1024
 MEMORY_TYPES = ("user", "feedback", "project", "reference")
+
+# 插件自动维护的三个戳（写在 frontmatter 的 metadata 下）：
+#   created  首次写入时间；改写、整理都不会把老记忆变"新"
+#   updated  最近一次修改时间；时效提醒按它算，不再依赖会被整理刷新的 mtime
+#   source   说出这条信息的人的数字 ID；与文件所记的人不同即为旁人转述
+STAMP_KEYS = ("created", "updated", "source")
+STAMP_FORMAT = "%Y-%m-%d %H:%M"
+# source 最多保留最近几个 ID，避免被反复改写的文件越积越长
+MAX_SOURCES = 5
 
 _SAFE_KEY_RE = re.compile(r"[^A-Za-z0-9._-]")
 _SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,120}$")
@@ -82,6 +92,44 @@ def _frontmatter_lines(block: str) -> list[str]:
     return result
 
 
+def format_stamp(ts: float) -> str:
+    """本地时间，如 2026-10-11 18:30。"""
+    return time.strftime(STAMP_FORMAT, time.localtime(ts))
+
+
+def parse_stamp(text: str) -> float | None:
+    """解析 created / updated 戳；只认日期或日期加时分，其他写法当没有。"""
+    text = (text or "").strip()
+    for fmt in (STAMP_FORMAT, "%Y-%m-%d"):
+        try:
+            return time.mktime(time.strptime(text, fmt))
+        except ValueError:
+            continue
+    return None
+
+
+_SOURCE_SEP_RE = re.compile(r"[,\s，、;；]+")
+
+
+def split_sources(text: str) -> list[str]:
+    """source 字段拆成 ID 列表（去重保序）。"""
+    items: list[str] = []
+    for raw in _SOURCE_SEP_RE.split(text or ""):
+        item = raw.strip()
+        if item and item not in items:
+            items.append(item)
+    return items
+
+
+def merge_sources(existing: str, added: str) -> str:
+    """并入新的来源 ID，只留最近 MAX_SOURCES 个。"""
+    items = split_sources(existing)
+    for item in split_sources(added):
+        if item not in items:
+            items.append(item)
+    return ", ".join(items[-MAX_SOURCES:])
+
+
 def parse_description(content: str) -> tuple[str, bool]:
     """从记忆文件内容提取索引钩子：(钩子文本, 是否来自 frontmatter)。
 
@@ -113,17 +161,21 @@ class MemoryDoc:
     type: str
     body: str
     has_frontmatter: bool
+    # metadata 下由插件维护的戳，原样字符串；缺失为空串
+    created: str = ""
+    updated: str = ""
+    source: str = ""
 
 
 def parse_memory(content: str) -> MemoryDoc:
-    """拆解记忆文件：frontmatter 的 name / description / type 与正文。
+    """拆解记忆文件：frontmatter 的 name / description / type、三个戳与正文。
 
     type 按规范写在 metadata 下一级（metadata:\\n  type: user），也兼容
     直接写在顶层的 type:，两处都有时以 metadata 下的为准。
     """
     match = _FRONTMATTER_RE.match(content or "")
     fields: dict[str, str] = {}
-    nested_type = ""
+    nested: dict[str, str] = {}
     if match:
         in_metadata = False
         for line in _frontmatter_lines(match.group(1)):
@@ -135,35 +187,133 @@ def parse_memory(content: str) -> MemoryDoc:
             key = key.strip().lower()
             value = value.strip().strip("'\"")
             if line[:1] in (" ", "\t"):
-                if in_metadata and key == "type":
-                    nested_type = value
+                if in_metadata and (key == "type" or key in STAMP_KEYS):
+                    nested.setdefault(key, value)
                 continue
             in_metadata = key == "metadata" and not value
             if key in ("name", "description", "type"):
                 fields.setdefault(key, value)
     body = content[match.end():] if match else (content or "")
-    mem_type = (nested_type or fields.get("type", "")).lower()
+    mem_type = (nested.get("type") or fields.get("type", "")).lower()
     return MemoryDoc(
         name=fields.get("name", ""),
         description=fields.get("description", ""),
         type=mem_type,
         body=body.strip("\n"),
         has_frontmatter=match is not None,
+        created=nested.get("created", ""),
+        updated=nested.get("updated", ""),
+        source=nested.get("source", ""),
     )
 
 
-def compose_memory(name: str, description: str, mem_type: str, body: str) -> str:
-    """按标准格式拼出记忆文件：frontmatter（name / description / metadata.type）+ 正文。"""
+def compose_memory(
+    name: str,
+    description: str,
+    mem_type: str,
+    body: str,
+    created: str = "",
+    updated: str = "",
+    source: str = "",
+) -> str:
+    """按标准格式拼出记忆文件：frontmatter（name / description / metadata.type）+ 正文。
+
+    三个戳平时不用传——写入时由 stamp_memory 自动补；传了就原样写进 metadata。
+    """
     description = _HOOK_WS_RE.sub(" ", description or "").strip()
+    meta = [f"  type: {mem_type.strip()}"]
+    for key, value in (("created", created), ("updated", updated), ("source", source)):
+        value = " ".join(str(value or "").split())
+        if value:
+            meta.append(f"  {key}: {value}")
     return (
         "---\n"
         f"name: {name.strip()}\n"
         f"description: {description}\n"
-        "metadata:\n"
-        f"  type: {mem_type.strip()}\n"
+        "metadata:\n" + "\n".join(meta) + "\n"
         "---\n\n"
         f"{(body or '').strip()}\n"
     )
+
+
+def _rewrite_metadata(inner: str, fields: dict[str, str]) -> str:
+    """把 fields 写进 frontmatter 的 metadata 块：同名旧行替换，其余行原样；
+    没有 metadata 块就在末尾补一个。只认 metadata 的直接子键，更深的
+    缩进（块标量的续行）不碰。"""
+    lines = inner.split("\n")
+    out: list[str] = []
+    placed = False
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        key, sep, value = line.partition(":")
+        is_meta = (
+            not placed
+            and bool(sep)
+            and line[:1] not in (" ", "\t")
+            and key.strip().lower() == "metadata"
+            and not value.strip()
+        )
+        out.append(line)
+        i += 1
+        if not is_meta:
+            continue
+        indent = ""
+        while i < len(lines) and (lines[i][:1] in (" ", "\t") or not lines[i].strip()):
+            nested_line = lines[i]
+            i += 1
+            if nested_line.strip():
+                depth = nested_line[: _indent(nested_line)]
+                indent = indent or depth
+                nested_key = nested_line.strip().partition(":")[0].strip().lower()
+                if depth == indent and nested_key in fields:
+                    continue
+            out.append(nested_line)
+        # 块尾的空行留在戳之后，顶层键之间的留白不变
+        tail: list[str] = []
+        while out and not out[-1].strip():
+            tail.append(out.pop())
+        indent = indent or "  "
+        out.extend(f"{indent}{k}: {v}" for k, v in fields.items())
+        out.extend(reversed(tail))
+        placed = True
+    if not placed:
+        while out and not out[-1].strip():
+            out.pop()
+        out.append("metadata:")
+        out.extend(f"  {k}: {v}" for k, v in fields.items())
+    return "\n".join(out)
+
+
+def stamp_memory(
+    content: str, now: float, source: str = "", previous: str | None = None
+) -> str:
+    """补齐 metadata 下的 created / updated / source，其余内容一个字不动。
+
+    created 先取已有文件的（改写、整理都不会把老记忆变"新"），没有才取
+    内容里写的，再没有才取现在；updated 一律取现在；source 取内容里写的
+    （没写则继承已有文件的），再并入本次的来源 ID。没有 frontmatter 的
+    内容原样返回。
+    """
+    match = _FRONTMATTER_RE.match(content or "")
+    if not match:
+        return content
+    doc = parse_memory(content)
+    prev = parse_memory(previous) if previous else None
+    created = ""
+    for candidate in ((prev.created if prev else ""), doc.created):
+        if candidate and parse_stamp(candidate) is not None:
+            created = candidate.strip()
+            break
+    fields = {
+        "created": created or format_stamp(now),
+        "updated": format_stamp(now),
+    }
+    sources = merge_sources(doc.source or (prev.source if prev else ""), source)
+    if sources:
+        fields["source"] = sources
+    head = _rewrite_metadata(match.group(1), fields)
+    return content[: match.start(1)] + head + content[match.end(1):]
 
 
 def extract_links(text: str) -> list[str]:
@@ -233,6 +383,14 @@ class MemoryHeader:
     # 小写化的文件开头（含 frontmatter），供关键词召回打分
     text: str = ""
     links: list[str] = field(default_factory=list)
+    # 由 frontmatter 的戳解析；updated 缺省时退回 mtime，created 缺省为 0
+    updated: float = 0.0
+    created: float = 0.0
+    source: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.updated:
+            self.updated = self.mtime
 
 
 @dataclass
@@ -396,6 +554,9 @@ class ScopeStore:
                     size=st.st_size,
                     text=content[:HEADER_TEXT_CHARS].lower(),
                     links=extract_links(doc.body),
+                    updated=parse_stamp(doc.updated) or st.st_mtime,
+                    created=parse_stamp(doc.created) or 0.0,
+                    source=doc.source,
                 )
                 self._headers[name] = (stamp, header)
                 result.append(header)
@@ -406,8 +567,11 @@ class ScopeStore:
 
     # ------------------------------------------------------------ 写 / 删
 
-    async def write(self, name: str, content: str) -> WriteReport:
-        """写入记忆文件并自动同步索引行（钩子取自 frontmatter description）。"""
+    async def write(self, name: str, content: str, source: str = "") -> WriteReport:
+        """写入记忆文件并自动同步索引行（钩子取自 frontmatter description）。
+
+        source 是本次写入的来源 ID（通常是当前发送者），并入文件的 source 戳。
+        """
         # 与 _resolve 同样的归一化：索引守门与索引行都要用整理后的名字，
         # 否则 " MEMORY.md" / "/MEMORY.md" 能绕过守门，索引行也会写错
         name = (name or "").strip().lstrip("/")
@@ -418,22 +582,105 @@ class ScopeStore:
             return WriteReport(
                 False,
                 "MEMORY.md 索引由插件自动维护，不可直接写入。"
-                "要修改某条索引行，重写对应记忆文件的 frontmatter description；"
+                "要修改某条索引行，改对应记忆文件的 frontmatter description；"
                 "要删除索引行，删除对应文件（delete=true）即可，索引会自动同步。",
             )
+        async with self._lock:
+            previous = await asyncio.to_thread(self._read_if_exists, path)
+            return await self._commit(
+                name, path, content, f"已写入 {name}", source, previous
+            )
+
+    @staticmethod
+    def _read_if_exists(path: Path) -> str | None:
+        try:
+            return path.read_text("utf-8") if path.is_file() else None
+        except OSError:
+            return None
+
+    async def edit(
+        self,
+        name: str,
+        old: str,
+        new: str,
+        replace_all: bool = False,
+        source: str = "",
+    ) -> WriteReport:
+        """局部替换：old 在文件里须恰好出现一次（replace_all 时可多次），其余原样保留。
+
+        读、换、写在同一把锁里完成，不会与并发的整文件写入交错；替换后的
+        全文照样过体积守门并同步索引行，改了 description 索引钩子随之更新。
+        """
+        name = (name or "").strip().lstrip("/")
+        path = self._resolve(name)
+        if path is None:
+            return WriteReport(False, f"文件名不合法：{self.path_rules()}")
+        if name.lower() == INDEX_FILENAME.lower():
+            return WriteReport(
+                False,
+                "MEMORY.md 索引由插件自动维护，不可直接修改。"
+                "要改某条索引行，改对应记忆文件 frontmatter 里的 description 即可。",
+            )
+        # 文件统一以 \n 落盘，模型传来的片段带 \r\n 也能对上
+        old = (old or "").replace("\r\n", "\n")
+        new = (new or "").replace("\r\n", "\n")
+        if not old:
+            return WriteReport(False, "old_text 不能为空：请给出文件里要被替换的原文片段。")
+        if old == new:
+            return WriteReport(False, "old_text 与 new_text 相同，没有可做的修改。")
+        async with self._lock:
+            if not path.is_file():
+                return WriteReport(
+                    False, f"文件不存在：{name}（新建文件请用 memory_write）"
+                )
+            content = await asyncio.to_thread(path.read_text, "utf-8")
+            count = content.count(old)
+            if count == 0:
+                return WriteReport(
+                    False,
+                    f"在 {name} 里没有找到 old_text。请先用 memory_read 读出当前内容，"
+                    "原样复制要改的片段（空格、换行、标点都要一致）。",
+                )
+            if count > 1 and not replace_all:
+                return WriteReport(
+                    False,
+                    f"old_text 在 {name} 里出现了 {count} 处，无法确定改哪一处："
+                    "把片段写长一些让它唯一，或设 replace_all=true 全部替换。",
+                )
+            replaced = count if replace_all else 1
+            updated = content.replace(old, new, replaced)
+            if not updated.strip():
+                return WriteReport(
+                    False,
+                    "改完整个文件就空了，不会写入；要删除文件请用 memory_write 并设 delete=true。",
+                )
+            return await self._commit(
+                name, path, updated, f"已修改 {name}，替换 {replaced} 处", source, content
+            )
+
+    async def _commit(
+        self,
+        name: str,
+        path: Path,
+        content: str,
+        done: str,
+        source: str = "",
+        previous: str | None = None,
+    ) -> WriteReport:
+        """持锁落盘：补戳 → 体积守门 → 原子写 → 失效头缓存 → 同步索引行。"""
+        content = stamp_memory(content, time.time(), source, previous)
         if len(content.encode("utf-8")) > MAX_FILE_BYTES:
             return WriteReport(
                 False,
                 f"内容超过单文件上限 {MAX_FILE_BYTES // 1024}KB，请精简后重写",
             )
         description, from_frontmatter = parse_description(content)
-        async with self._lock:
-            await asyncio.to_thread(self._write_atomic, path, content)
-            self._drop_header(name)
-            lines, size = await asyncio.to_thread(
-                self._sync_index_line, name, description
-            )
-        message = f"已写入 {name}，索引行已同步"
+        await asyncio.to_thread(self._write_atomic, path, content)
+        self._drop_header(name)
+        lines, size = await asyncio.to_thread(
+            self._sync_index_line, name, description
+        )
+        message = f"{done}，索引行已同步"
         if not from_frontmatter:
             message += (
                 "（未找到 frontmatter 的 description，索引钩子暂取正文首行；"
@@ -668,8 +915,17 @@ class ScopeStore:
         return "（正文匹配）"
 
 
+# 人物记忆一人一个文件：user-<数字ID>.md
+_PERSON_FILE_RE = re.compile(r"^user-\d+\.md$")
+
+
+def is_person_file(name: str) -> bool:
+    return bool(_PERSON_FILE_RE.match((name or "").strip()))
+
+
 class MemoryStore:
-    """双层作用域的记忆库根。作用域目录按需创建、ScopeStore 按键缓存。"""
+    """三层作用域的记忆库根：global（机器人自我）、session（每个会话）、
+    people（每个平台的人物记忆）。作用域目录按需创建、ScopeStore 按键缓存。"""
 
     def __init__(self, base_dir: Path):
         self.base_dir = base_dir
@@ -697,7 +953,25 @@ class MemoryStore:
 
     def session_keys(self) -> list[str]:
         """磁盘上已有记忆目录的会话（目录名）。"""
-        root = self.base_dir / "session"
+        return self._subdirs("session")
+
+    def people_scope(self, platform: str) -> ScopeStore:
+        """某个平台的人物记忆：一人一个文件，该平台的所有群聊和私聊共享。
+        按平台分目录是因为不同平台的数字 ID 可能撞号。"""
+        return self._scope(self.base_dir / "people" / safe_key(platform or "unknown"))
+
+    def people_scope_by_key(self, key: str) -> ScopeStore | None:
+        """按目录名取人物作用域；目录名不合法返回 None。"""
+        if not is_scope_key(key):
+            return None
+        return self._scope(self.base_dir / "people" / key)
+
+    def people_keys(self) -> list[str]:
+        """磁盘上已有人物记忆目录的平台（目录名）。"""
+        return self._subdirs("people")
+
+    def _subdirs(self, layer: str) -> list[str]:
+        root = self.base_dir / layer
         if not root.is_dir():
             return []
         return sorted(

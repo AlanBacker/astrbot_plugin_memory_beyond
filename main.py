@@ -50,6 +50,9 @@ MIN_TAIL_BUDGET = 1000
 # 全局记忆关闭时对 scope=global 工具调用的固定回执；工具说明是静态的
 # 仍会列出 global，回执要把模型引导回 session。
 GLOBAL_MEMORY_OFF = "全局记忆已在插件配置中停用；请改用 session 作用域。"
+PEOPLE_MEMORY_OFF = "人物记忆已在插件配置中停用；关于人的信息请写 session 作用域。"
+PEOPLE_FILE_RULE = "people 作用域一人一个文件，文件名必须是 user-<数字ID>.md。"
+SCOPE_ARG_ERROR = "scope 参数必须是 global、session 或 people。"
 # 会话运行时缓存上限（LRU 淘汰，仅内存快照，磁盘状态不受影响）。
 MAX_RUNTIME_SESSIONS = 256
 # 模型挑选召回记忆时的单次超时：挑选在回复之前完成，等太久不如退回关键词
@@ -389,6 +392,19 @@ class MemoryBeyondPlugin(Star):
     def _session_scope(self, event: AstrMessageEvent) -> memstore.ScopeStore:
         return self._store.session_scope(str(event.unified_msg_origin))
 
+    def _people_on(self) -> bool:
+        """人物记忆开关，默认关闭。开启后每个平台一份人物目录、一人一个文件，
+        该平台的所有会话共享；关闭时各会话各记各的，已有文件原样保留。"""
+        return self._bool("enable_people_memory", False)
+
+    @staticmethod
+    def _platform_of(umo: str) -> str:
+        platform, _, _ = registry.parse_umo(umo)
+        return platform or str(umo or "").split(":", 1)[0] or "unknown"
+
+    def _people_scope(self, umo: str) -> memstore.ScopeStore:
+        return self._store.people_scope(self._platform_of(umo))
+
     def _scope_for(
         self, event: AstrMessageEvent, scope: str
     ) -> memstore.ScopeStore | None:
@@ -397,7 +413,23 @@ class MemoryBeyondPlugin(Star):
             return self._global_scope()
         if scope == "session":
             return self._session_scope(event)
+        if scope == "people":
+            return self._people_scope(str(event.unified_msg_origin))
         return None
+
+    def _tool_store(
+        self, event: AstrMessageEvent, scope: str
+    ) -> tuple[memstore.ScopeStore | None, str, str]:
+        """记忆工具的作用域解析：返回 (作用域, 归一化名称, 拒绝原因)。"""
+        scope = (scope or "").strip().lower()
+        if scope == "global" and not self._global_on():
+            return None, scope, GLOBAL_MEMORY_OFF
+        if scope == "people" and not self._people_on():
+            return None, scope, PEOPLE_MEMORY_OFF
+        store = self._scope_for(event, scope)
+        if store is None:
+            return None, scope, SCOPE_ARG_ERROR
+        return store, scope, ""
 
     # ================================================================ 钩子
 
@@ -505,7 +537,7 @@ class MemoryBeyondPlugin(Star):
             # ---- 相关记忆召回：本轮用得上的记忆全文附在新消息之前 ----
             recall_msg = await self._recall_message(event, umo, query)
 
-        guidance = prompts.memory_guidance(self._global_on()) if memory_on else ""
+        guidance = prompts.memory_guidance(self._global_on(), self._people_on()) if memory_on else ""
         estimator = tokens.TokenEstimator(state.ratio)
 
         overhead = (
@@ -706,6 +738,8 @@ class MemoryBeyondPlugin(Star):
             ]
             if self._global_on():
                 scopes.append(("global", self._global_scope()))
+            if self._people_on():
+                scopes.append(("people", self._people_scope(umo)))
             candidates: list[recall.Candidate] = []
             stores: dict[str, memstore.ScopeStore] = {}
             for label, store in scopes:
@@ -721,7 +755,10 @@ class MemoryBeyondPlugin(Star):
             )
             chosen = None
             if mode == "llm" and query.strip():
-                chosen = await self._select_by_model(umo, candidates, query, limit)
+                # 人物文件只走身份必选，不让模型从别的群的人里挑
+                chosen = await self._select_by_model(
+                    umo, [c for c in candidates if c.scope != "people"], query, limit
+                )
                 if chosen is not None:
                     keyword_forced = recall.select_by_keywords(
                         candidates, "", forced, limit
@@ -735,7 +772,7 @@ class MemoryBeyondPlugin(Star):
                 content = await stores[cand.scope].read(cand.header.file)
                 if content:
                     items.append(
-                        recall.Recalled(cand.ref, content, cand.header.mtime)
+                        recall.Recalled(cand.ref, content, cand.header.updated)
                     )
             block = recall.build_recall_block(items, prompts.DATA_NOTICE)
             return recall.build_recall_message(block) if block else None
@@ -769,58 +806,83 @@ class MemoryBeyondPlugin(Star):
     # ============================================================ 记忆提取
 
     async def _existing_for_extract(
-        self, scope: memstore.ScopeStore, transcript: str
-    ) -> tuple[str, set[str]]:
-        """抽取前给模型看的已有记忆：相关的附全文（可合并改写），其余只列名字。
+        self,
+        scope: memstore.ScopeStore,
+        transcript: str,
+        people: memstore.ScopeStore | None = None,
+    ) -> tuple[str, dict[str, set[str]]]:
+        """抽取前给模型看的已有记忆：相关的附全文（可合并改写），其余只列名字；
+        人物记忆开启时，对话里说话人的人物文件也附全文（文件名前缀 people/）。
 
-        返回 (提示词片段, 允许被改写的文件名集合)。
+        返回 (提示词片段, 各作用域允许被改写的文件名集合)。
         """
+        updatable: dict[str, set[str]] = {"session": set(), "people": set()}
         headers = await asyncio.to_thread(scope.headers)
-        if not headers:
-            return "", set()
-        candidates = [recall.Candidate("session", h) for h in headers]
-        forced = [f"user-{uid}.md" for uid in prompts.sender_ids_in(transcript)]
-        related = recall.select_by_keywords(
-            candidates, transcript, forced, recall.DEFAULT_MAX_FILES
-        )
+        speakers = [f"user-{uid}.md" for uid in prompts.sender_ids_in(transcript)]
         full: list[prompts.ExistingMemory] = []
         used = 0
-        for cand in related:
-            content = await scope.read(cand.header.file)
-            if not content or used + len(content) > prompts.EXISTING_FULL_CHARS:
-                continue
-            used += len(content)
-            full.append(
-                prompts.ExistingMemory(
-                    cand.header.file, cand.header.description, content
-                )
+        if headers:
+            candidates = [recall.Candidate("session", h) for h in headers]
+            related = recall.select_by_keywords(
+                candidates, transcript, speakers, recall.DEFAULT_MAX_FILES
             )
-        updatable = {item.file for item in full}
+            for cand in related:
+                content = await scope.read(cand.header.file)
+                if not content or used + len(content) > prompts.EXISTING_FULL_CHARS:
+                    continue
+                used += len(content)
+                full.append(
+                    prompts.ExistingMemory(
+                        cand.header.file, cand.header.description, content
+                    )
+                )
+            updatable["session"] = {item.file for item in full}
+        if people is not None:
+            for name in speakers:
+                content = await people.read(name)
+                if not content or used + len(content) > prompts.EXISTING_FULL_CHARS:
+                    continue
+                used += len(content)
+                doc = memstore.parse_memory(content)
+                full.append(
+                    prompts.ExistingMemory(
+                        prompts.PEOPLE_PREFIX + name, doc.description, content
+                    )
+                )
+                updatable["people"].add(name)
         listed = [
             prompts.ExistingMemory(h.file, h.description)
             for h in headers
-            if h.file not in updatable
+            if h.file not in updatable["session"]
         ]
+        if not full and not listed:
+            return "", updatable
         return prompts.build_existing_section(full, listed), updatable
 
     async def _store_drafts(
         self,
         umo: str,
         drafts: list[prompts.MemoryDraft],
-        updatable: set[str],
+        updatable: dict[str, set[str]],
         source: str,
     ) -> int:
-        """抽取出的记忆落盘到会话作用域。
+        """抽取出的记忆落盘：默认进会话作用域；人物记忆开启时，模型标为
+        people 的人物文件进该平台的人物作用域。绝不进全局。
 
-        自动提取的信息可能源自群聊，按隐私边界只进会话作用域、绝不进全局。
         已存在的文件只有在抽取时附过全文（模型据此合并）才允许改写，
         其余同名条目跳过——看不到原文就覆盖会丢内容。
         """
-        scope = self._store.session_scope(umo)
+        stores = {"session": self._store.session_scope(umo)}
+        if self._people_on():
+            stores["people"] = self._people_scope(umo)
         stored = 0
         for draft in drafts:
+            label = draft.scope if draft.scope in stores else "session"
+            scope = stores[label]
             try:
-                if draft.filename not in updatable and scope.exists(draft.filename):
+                if draft.filename not in updatable.get(label, set()) and scope.exists(
+                    draft.filename
+                ):
                     continue
                 report = await scope.write(
                     draft.filename, prompts.render_memory_file(draft)
@@ -830,7 +892,7 @@ class MemoryBeyondPlugin(Star):
                     stored += 1
             except OSError as exc:
                 logger.warning(
-                    LOG_PREFIX + f"{source}写入记忆 {draft.filename} 失败：{exc}"
+                    LOG_PREFIX + f"{source}写入记忆 {label}/{draft.filename} 失败：{exc}"
                 )
         if stored:
             logger.info(LOG_PREFIX + f"会话 {umo} {source}写入了 {stored} 条记忆")
@@ -873,9 +935,14 @@ class MemoryBeyondPlugin(Star):
         self, rt: RuntimeSession, umo: str, transcript: str
     ) -> None:
         try:
+            people_on = self._people_on()
             scope = self._store.session_scope(umo)
-            existing, updatable = await self._existing_for_extract(scope, transcript)
-            prompt = prompts.build_background_extract_prompt(transcript, existing)
+            existing, updatable = await self._existing_for_extract(
+                scope, transcript, self._people_scope(umo) if people_on else None
+            )
+            prompt = prompts.build_background_extract_prompt(
+                transcript, existing, people_on
+            )
             text, attempts_log = await self._call_summarizer(umo, prompt)
             if not text:
                 logger.info(
@@ -884,7 +951,7 @@ class MemoryBeyondPlugin(Star):
                     "下个周期再试"
                 )
                 return
-            drafts = prompts.parse_memories(text)
+            drafts = prompts.parse_memories(text, people_on)
             await self._store_drafts(umo, drafts, updatable, "后台提取")
         except Exception:  # noqa: BLE001
             logger.warning(LOG_PREFIX + f"会话 {umo} 后台记忆提取出错", exc_info=True)
@@ -920,10 +987,13 @@ class MemoryBeyondPlugin(Star):
         extract = self._bool("extract_memories", True) and self._bool(
             "enable_memory", True
         )
-        existing, updatable = "", set()
+        people_on = self._people_on()
+        existing, updatable = "", {}
         if extract:
             existing, updatable = await self._existing_for_extract(
-                self._store.session_scope(umo), transcript
+                self._store.session_scope(umo),
+                transcript,
+                self._people_scope(umo) if people_on else None,
             )
         max_chars = max(
             200, self._int("summary_max_chars", prompts.SUMMARY_MAX_CHARS_DEFAULT)
@@ -936,10 +1006,11 @@ class MemoryBeyondPlugin(Star):
             existing,
             now=prompts.format_time(now),
             max_chars=max_chars,
+            include_people=people_on,
         )
         text, attempts_log = await self._call_summarizer(umo, prompt)
         if text:
-            summary, drafts = prompts.parse_summary_response(text)
+            summary, drafts = prompts.parse_summary_response(text, people_on)
         else:
             summary, drafts = "", []
         if not summary:
@@ -1217,25 +1288,25 @@ class MemoryBeyondPlugin(Star):
         """读取长期记忆文件的完整内容。注入的索引只是目录：回答涉及某人、某事的细节之前，先用本工具取回对应文件再作答，不要凭索引行猜；更新某条记忆之前也先读它的当前内容。
 
         Args:
-            scope(string): 作用域，global（机器人自我的全局记忆）或 session（当前会话的记忆）
+            scope(string): 作用域，global（机器人自我的全局记忆）、session（当前会话的记忆）或 people（同一平台所有会话共享的人物记忆，一人一个 user-<数字ID>.md）
             file(string): 记忆文件名，如 user-12345678.md；省略时读 MEMORY.md 索引全文
         """
         if not self._bool("enable_memory", True):
             return "记忆功能已在插件配置中停用。"
-        scope = (scope or "").strip().lower()
-        if scope == "global" and not self._global_on():
-            return GLOBAL_MEMORY_OFF
-        store = self._scope_for(event, scope)
+        store, scope, refused = self._tool_store(event, scope)
         if store is None:
-            return "scope 参数必须是 global 或 session。"
+            return refused
         content = await store.read(file)
         if content is None:
             existing = store.list_files()
             listing = "、".join(existing) if existing else "（该作用域还没有记忆文件）"
             return f"文件 {file} 不存在。该作用域现有文件：{listing}"
         if file.strip() != memstore.INDEX_FILENAME:
-            mtime = store.mtime(file)
-            note = recall.freshness_note(mtime) if mtime else ""
+            # 时效按 frontmatter 的 updated 戳算；老文件没有戳才退回 mtime
+            written = memstore.parse_stamp(
+                memstore.parse_memory(content).updated
+            ) or store.mtime(file)
+            note = recall.freshness_note(written) if written else ""
             if note:
                 return f"{note}\n\n{content}"
         return content
@@ -1249,38 +1320,106 @@ class MemoryBeyondPlugin(Star):
         content: str = "",
         delete: bool = False,
     ) -> str:
-        """写入、修改或删除一个长期记忆文件（整文件覆盖；修改＝读出后改写重写入，删除＝delete 设 true）。一个文件只记一条事实，content 必须以 frontmatter 开头：--- / name: 与文件名一致 / description: 一句话钩子 / metadata: / type: user|feedback|project|reference / ---，正文写事实本身。MEMORY.md 索引由插件自动维护，禁止直接写：要改索引行就重写对应文件的 description，要删索引行就删除对应文件。写前先查重，同一个人、同一件事始终更新同一个文件，不另建重复文件。作用域边界：关于具体用户或本会话的信息一律写 session，记人以发送者标注中的数字 ID 为锚（文件名 user-<数字ID>.md，昵称只作正文附注）；global 只存机器人自身的偏好与行为准则。
+        """写入、修改或删除一个长期记忆文件（整文件覆盖；修改＝读出后改写重写入，删除＝delete 设 true）。一个文件只记一条事实，content 必须以 frontmatter 开头：--- / name: 与文件名一致 / description: 一句话钩子 / metadata: / type: user|feedback|project|reference / ---，正文写事实本身。MEMORY.md 索引由插件自动维护，禁止直接写：要改索引行就重写对应文件的 description，要删索引行就删除对应文件。写前先查重，同一个人、同一件事始终更新同一个文件，不另建重复文件。作用域边界：关于具体用户或本会话的信息一律写 session，记人以发送者标注中的数字 ID 为锚（文件名 user-<数字ID>.md，昵称只作正文附注）；global 只存机器人自身的偏好与行为准则；people（启用时）只存某人亲口说的、换个群也成立的身份类事实。
 
         Args:
-            scope(string): 作用域，global（机器人自我的全局记忆）或 session（当前会话的记忆）
+            scope(string): 作用域，global（机器人自我的全局记忆）、session（当前会话的记忆）或 people（同一平台所有会话共享的人物记忆，一人一个 user-<数字ID>.md）
             file(string): 记忆文件名，须以 .md 结尾，如 user-12345678.md；不可为 MEMORY.md
             content(string): 完整的文件内容，含 frontmatter（delete 为 false 时必填）
             delete(boolean): 设为 true 时删除该文件并自动移除其索引行，此时忽略 content
         """
         if not self._bool("enable_memory", True):
             return "记忆功能已在插件配置中停用。"
-        scope = (scope or "").strip().lower()
-        if scope == "global" and not self._global_on():
-            return GLOBAL_MEMORY_OFF
-        store = self._scope_for(event, scope)
+        store, scope, refused = self._tool_store(event, scope)
         if store is None:
-            return "scope 参数必须是 global 或 session。"
+            return refused
+        if scope == "people" and not memstore.is_person_file(file):
+            return PEOPLE_FILE_RULE
         if delete:
             report = await store.delete(file)
         else:
             if not content.strip():
                 return "content 为空。写入需提供完整文件内容；如要删除请设 delete=true。"
-            report = await store.write(file, content)
+            existed = store.exists(file)
+            report = await store.write(
+                file, content, source=self._sender_identity(event)[0]
+            )
+            if report.ok and not existed:
+                hint = await self._duplicate_hint(store, file, content)
+                if hint:
+                    report = memstore.WriteReport(True, report.message + "\n" + hint)
         if report.ok:
-            # 索引快照不在这里刷新：开头的注入内容一变，整段历史的提示词
-            # 缓存都会失效。新写的记忆已在磁盘上，相关时由召回带上全文，
-            # 下次压缩或新对话时进入索引。这里只记下"主模型自己记过了"，
-            # 后台定期提取据此跳过这一段。
-            umo = str(getattr(event, "unified_msg_origin", "") or "")
-            rt = self._sessions.get(umo)
-            if rt is not None:
-                rt.state.wrote_since_extract = True
+            self._note_model_wrote(event)
         return report.message
+
+    @filter.llm_tool(name="memory_edit")
+    async def memory_edit(
+        self,
+        event: AstrMessageEvent,
+        scope: str,
+        file: str,
+        old_text: str,
+        new_text: str,
+        replace_all: bool = False,
+    ) -> str:
+        """局部修改一个已有的长期记忆文件：把 old_text 替换成 new_text，文件其余内容原样保留。改一处、补一句、更新 description 时用本工具，不要用 memory_write 整文件重写（重写容易丢内容）。old_text 必须与文件现有内容逐字一致（空格、换行、标点都算）且只出现一次，所以先用 memory_read 读出当前内容再复制片段；new_text 留空等于删掉这段。改了 frontmatter 的 description，索引行会自动同步。
+
+        Args:
+            scope(string): 作用域，global（机器人自我的全局记忆）、session（当前会话的记忆）或 people（同一平台所有会话共享的人物记忆，一人一个 user-<数字ID>.md）
+            file(string): 要修改的记忆文件名，如 user-12345678.md；不可为 MEMORY.md
+            old_text(string): 要被替换的原文片段，须与文件内容逐字一致且只出现一次
+            new_text(string): 替换后的文字；留空表示删掉 old_text
+            replace_all(boolean): 设为 true 时替换文件里所有匹配处（如统一改一个称呼），默认只接受唯一匹配
+        """
+        if not self._bool("enable_memory", True):
+            return "记忆功能已在插件配置中停用。"
+        store, scope, refused = self._tool_store(event, scope)
+        if store is None:
+            return refused
+        if scope == "people" and not memstore.is_person_file(file):
+            return PEOPLE_FILE_RULE
+        report = await store.edit(
+            file,
+            old_text,
+            new_text,
+            replace_all,
+            source=self._sender_identity(event)[0],
+        )
+        if report.ok:
+            self._note_model_wrote(event)
+        return report.message
+
+    async def _duplicate_hint(
+        self, store: memstore.ScopeStore, file: str, content: str
+    ) -> str:
+        """新建文件后用召回的打分看看有没有疑似记同一件事的旧文件，有就提醒合并。"""
+        try:
+            doc = memstore.parse_memory(content)
+            text = f"{doc.description} {doc.body[:600]}"
+            headers = await asyncio.to_thread(store.headers)
+            similar = recall.similar_memories(text, headers, file)
+        except Exception:  # noqa: BLE001 - 查重只是提醒，失败不影响写入
+            logger.debug(LOG_PREFIX + "写入查重失败", exc_info=True)
+            return ""
+        if not similar:
+            return ""
+        listing = "；".join(
+            f"{h.file}（{h.description or '无描述'}）" for h in similar
+        )
+        return (
+            f"提醒：新文件可能与已有记忆记的是同一件事：{listing}。"
+            "请核对，确属同一件事就合并进一个文件、删掉多余的。"
+        )
+
+    def _note_model_wrote(self, event: AstrMessageEvent) -> None:
+        # 索引快照不在这里刷新：开头的注入内容一变，整段历史的提示词
+        # 缓存都会失效。新写的记忆已在磁盘上，相关时由召回带上全文，
+        # 下次压缩或新对话时进入索引。这里只记下"主模型自己记过了"，
+        # 后台定期提取据此跳过这一段。
+        umo = str(getattr(event, "unified_msg_origin", "") or "")
+        rt = self._sessions.get(umo)
+        if rt is not None:
+            rt.state.wrote_since_extract = True
 
     @filter.llm_tool(name="memory_search")
     async def memory_search(
@@ -1290,7 +1429,7 @@ class MemoryBeyondPlugin(Star):
 
         Args:
             query(string): 搜索词，可用空格分隔多个词（须同时命中）
-            scope(string): 搜索范围，global、session 或 all（默认，两个作用域都搜）
+            scope(string): 搜索范围，global、session、people 或 all（默认，启用的作用域都搜）
         """
         if not self._bool("enable_memory", True):
             return "记忆功能已在插件配置中停用。"
@@ -1299,16 +1438,23 @@ class MemoryBeyondPlugin(Star):
             return "query 不能为空。"
         scope = (scope or "all").strip().lower()
         global_on = self._global_on()
+        people_on = self._people_on()
         if scope == "global" and not global_on:
             return GLOBAL_MEMORY_OFF
+        if scope == "people" and not people_on:
+            return PEOPLE_MEMORY_OFF
         stores: list[tuple[str, memstore.ScopeStore]] = []
-        # 关闭全局时 scope=all 静默降级为只搜会话
+        # 停用的作用域在 scope=all 时静默略过
         if scope in ("global", "all") and global_on:
             stores.append(("global", self._global_scope()))
         if scope in ("session", "all"):
             stores.append(("session", self._session_scope(event)))
+        if scope in ("people", "all") and people_on:
+            stores.append(
+                ("people", self._people_scope(str(event.unified_msg_origin)))
+            )
         if not stores:
-            return "scope 参数必须是 global、session 或 all。"
+            return "scope 参数必须是 global、session、people 或 all。"
         lines: list[str] = []
         for label, store in stores:
             for hit in await store.search(query):
@@ -1379,7 +1525,7 @@ class MemoryBeyondPlugin(Star):
             "overhead": (
                 estimator.messages(contexts[:n_system])
                 + estimator.text(
-                    prompts.memory_guidance(self._global_on()) if memory_on else ""
+                    prompts.memory_guidance(self._global_on(), self._people_on()) if memory_on else ""
                 )
             ),
             "tools": tools_cost,
@@ -1409,6 +1555,11 @@ class MemoryBeyondPlugin(Star):
             f"全局 {len(self._global_scope().list_files())} 个文件"
             if global_on
             else "全局 停用"
+        )
+        people_part = (
+            f"人物 {len(self._people_scope(umo).list_files())} 个文件"
+            if self._people_on()
+            else "人物 停用"
         )
         session_files = self._session_scope(event).list_files()
         configured_id = self._str("summary_provider_id").strip() or "（未配置，用当前对话提供商）"
@@ -1464,7 +1615,7 @@ class MemoryBeyondPlugin(Star):
         lines = [
             "Memory Beyond 状态",
             f"记忆：{'启用' if self._bool('enable_memory', True) else '停用'}"
-            f"（{global_part} / 会话 {len(session_files)} 个文件）",
+            f"（{global_part} / {people_part} / 会话 {len(session_files)} 个文件）",
             f"压缩：{'启用' if self._bool('enable_compression', True) else '停用'}",
             f"上下文窗口：{window if window > 0 else '未知'}（{window_note}）",
             f"触发阈值：{self._threshold():g}，压缩目标：{self._target_ratio():g}",

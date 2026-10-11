@@ -86,13 +86,20 @@ class FakePlugin:
         self._archive = pkg_archive.ArchiveStore(base / "archive")
         self._sessions: dict = {}
         self._state_dir = base / "state"
-        self.config = {"enable_memory": True, "enable_global_memory": False}
+        self.config = {
+            "enable_memory": True,
+            "enable_global_memory": False,
+            "enable_people_memory": False,
+        }
         self.invalidated: list = []
         self.prompts: list = []
         self.summarizer_reply = ""
 
     def _global_on(self):
         return self.config["enable_global_memory"]
+
+    def _people_on(self):
+        return self.config["enable_people_memory"]
 
     def _bool(self, key, default):
         return self.config.get(key, default)
@@ -287,7 +294,10 @@ def test_file_save_create_edit_rename(plugin, dash):
 def test_file_save_raw_mode(plugin, dash):
     content = "---\nname: a\ndescription: 原文模式\nmetadata:\n  type: project\n---\n\n正文\n"
     ok(call(dash, "file/save", body={"scope": "session", "key": KEY, "file": "a.md", "mode": "raw", "content": content}))
-    assert asyncio.run(session_store(plugin).read("a.md")) == content
+    saved = asyncio.run(session_store(plugin).read("a.md"))
+    # 原文照存，只在 metadata 下补了戳
+    assert saved.startswith("---\nname: a\ndescription: 原文模式\nmetadata:\n  type: project\n  created: ")
+    assert saved.endswith("\n---\n\n正文\n")
     assert "不能为空" in err(
         call(dash, "file/save", body={"scope": "session", "key": KEY, "file": "b.md", "mode": "raw", "content": "  "})
     )
@@ -488,3 +498,51 @@ def test_file_name_guard_is_case_insensitive(plugin, dash):
     asyncio.run(session_store(plugin).write("a.md", memory("a", "d")))
     msg = err(call(dash, "file", query={"scope": "session", "key": KEY, "file": "memory.md"}))
     assert "索引" in msg
+
+
+def test_file_detail_and_listing_expose_stamps(plugin, dash):
+    store = session_store(plugin)
+    asyncio.run(store.write("s.md", memory("s", "d"), source="111"))
+    detail = ok(call(dash, "file", {"scope": "session", "key": KEY, "file": "s.md"}))
+    assert detail["source"] == "111" and detail["created"] and detail["updated"] == detail["created"]
+    listing = ok(call(dash, "scope", {"scope": "session", "key": KEY}))
+    item = next(f for f in listing["files"] if f["file"] == "s.md")
+    assert item["source"] == "111" and item["created"] > 0 and item["updated"] > 0
+    # 管理页改写：created 保留、source 继承
+    ok(call(dash, "file/save", body={
+        "scope": "session", "key": KEY, "file": "s.md", "oldFile": "s.md", "mode": "fields",
+        "type": "user", "description": "d2", "body": "b2", "baseMtime": detail["mtime"],
+    }))
+    again = ok(call(dash, "file", {"scope": "session", "key": KEY, "file": "s.md"}))
+    assert again["created"] == detail["created"] and again["source"] == "111"
+    assert (again["description"], again["body"]) == ("d2", "b2")
+
+
+def test_people_scope_routes(plugin, dash):
+    assert ok(call(dash, "overview"))["people"] == {"enabled": False, "platforms": []}
+    people = plugin._store.people_scope("aiocqhttp")
+    asyncio.run(people.write("user-1.md", memory("user-1", "阿杰")))
+    plugin.config["enable_people_memory"] = True
+    data = ok(call(dash, "overview"))
+    assert data["people"]["enabled"] is True
+    assert data["people"]["platforms"][0]["key"] == "aiocqhttp"
+    assert data["people"]["platforms"][0]["fileCount"] == 1
+    detail = ok(call(dash, "scope", {"scope": "people", "key": "aiocqhttp"}))
+    assert detail["enabled"] is True and detail["people"]["platform"] == "aiocqhttp"
+    assert [f["file"] for f in detail["files"]] == ["user-1.md"]
+    assert "不合法" in err(call(dash, "scope", {"scope": "people", "key": "../x"}))
+    assert "people" in err(call(dash, "scope", {"scope": "nope", "key": ""}))
+    base = {
+        "scope": "people", "key": "aiocqhttp", "mode": "fields",
+        "type": "user", "description": "d", "body": "b",
+    }
+    assert "user-<数字ID>" in err(call(dash, "file/save", body={**base, "file": "note.md"}))
+    assert "只能是 user" in err(
+        call(dash, "file/save", body={**base, "file": "user-2.md", "type": "project"})
+    )
+    ok(call(dash, "file/save", body={**base, "file": "user-2.md"}))
+    assert set(people.list_files()) == {"user-1.md", "user-2.md"}
+    plugin.config["enable_people_memory"] = False
+    # 关闭后文件仍在、页面仍可看，只是标成未启用
+    assert ok(call(dash, "scope", {"scope": "people", "key": "aiocqhttp"}))["enabled"] is False
+    assert ok(call(dash, "overview"))["people"]["platforms"][0]["fileCount"] == 2

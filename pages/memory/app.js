@@ -25,6 +25,11 @@
     selfMemory: "机器人自身",
     globalTitle: "全局记忆",
     globalSub: "所有会话共享",
+    peopleLabel: "人物记忆",
+    peopleTitle: "人物记忆 · {platform}",
+    peopleSub: "同一平台所有会话共享，一人一个文件",
+    peopleNone: "还没有人物记忆：机器人记下某个人之后会按平台出现在这里",
+    peopleOffNotice: "人物记忆未启用：机器人当前不会读取或写入这里的内容。如需使用，请在插件配置中开启「启用人物记忆」。",
     sessionsLabel: "会话 · {n}",
     noSessions: "没有符合条件的会话",
     noBridge: "请在 AstrBot 管理面板的「插件页面」中打开此页面。",
@@ -90,6 +95,8 @@
     linkMissing: "这条记忆不存在",
     newHint: "新记忆会在下一次对话开始或下一次压缩后进入索引",
     savedAt: "最近写入：{time}",
+    stampLine: "首次记于 {created} · 最近更新 {updated}",
+    sourceLine: "来源 ID {ids}",
     delete: "删除",
     cancel: "取消",
     save: "保存",
@@ -975,6 +982,36 @@
         h("span", { class: "count" }, g.fileCount)
       )
     );
+    const people = state.overview.people || { enabled: false, platforms: [] };
+    if (people.enabled || people.platforms.length) {
+      list.append(h("div", { class: "list-label" }, t("peopleLabel")));
+      if (!people.platforms.length) {
+        list.append(h("div", { class: "empty", style: "padding:12px" }, h("span", null, t("peopleNone"))));
+      }
+      people.platforms.forEach(function (p) {
+        const active = isSelected({ scope: "people", key: p.key });
+        list.append(
+          h(
+            "button",
+            {
+              class: "session-item" + (active ? " active" : ""),
+              title: p.platform,
+              onclick: function () {
+                selectScope({ scope: "people", key: p.key });
+              },
+            },
+            h("div", { class: "avatar people" }, icon("user")),
+            h(
+              "div",
+              { class: "session-text" },
+              h("div", { class: "session-name" }, p.platform),
+              h("div", { class: "session-sub" }, people.enabled ? t("peopleSub") : t("disabled"))
+            ),
+            h("span", { class: "count" }, p.fileCount)
+          )
+        );
+      });
+    }
     const sessions = filteredSessions();
     list.append(h("div", { class: "list-label" }, t("sessionsLabel", { n: sessions.length })));
     if (!sessions.length) {
@@ -1078,10 +1115,12 @@
   function renderDetail() {
     const d = state.detail;
     const isGlobal = d.scope === "global";
+    const isPeople = d.scope === "people";
+    const isSession = !isGlobal && !isPeople;
     const s = d.session || {};
     const meta = [];
-    if (isGlobal) {
-      meta.push(h("span", null, t("globalSub")));
+    if (isGlobal || isPeople) {
+      meta.push(h("span", null, t(isPeople ? "peopleSub" : "globalSub")));
       meta.push(h("span", { class: "tag " + (d.enabled ? "ok" : "warn") }, d.enabled ? t("enabled") : t("disabled")));
     } else {
       meta.push(h("span", null, kindLabel(s.kind)));
@@ -1100,7 +1139,7 @@
     }
 
     const actions = [];
-    if (!isGlobal) {
+    if (isSession) {
       actions.push(h("button", { class: "btn", onclick: editRemark }, icon("edit"), t("remark")));
     }
     actions.push(
@@ -1111,11 +1150,17 @@
         t("consolidate")
       )
     );
-    if (!isGlobal) {
+    if (isSession) {
       actions.push(h("button", { class: "btn danger", onclick: purgeSession }, icon("trash"), t("purge")));
     }
 
-    const title = isGlobal ? t("globalTitle") : sessionTitle(s);
+    const title = isGlobal
+      ? t("globalTitle")
+      : isPeople
+        ? t("peopleTitle", { platform: (d.people || {}).platform || d.key })
+        : sessionTitle(s);
+    const avatarKind = isGlobal ? "global" : isPeople ? "people" : s.kind;
+    const avatarIcon = isGlobal ? "bot" : isPeople ? "user" : KIND_ICON[s.kind] || "chat";
     const head = h(
       "div",
       { class: "detail-head" },
@@ -1123,11 +1168,11 @@
         "div",
         { class: "detail-title" },
         h("button", { class: "btn ghost icon-only mobile-only", title: t("back"), onclick: backToList }, icon("back")),
-        h("div", { class: "avatar " + (isGlobal ? "global" : s.kind) }, icon(isGlobal ? "bot" : KIND_ICON[s.kind] || "chat")),
+        h("div", { class: "avatar " + avatarKind }, icon(avatarIcon)),
         h(
           "div",
           { style: "min-width:0" },
-          h("h2", { title: isGlobal ? "" : s.umo || s.key }, title),
+          h("h2", { title: isSession ? s.umo || s.key : "" }, title),
           h("div", { class: "meta-row" }, meta)
         )
       ),
@@ -1141,9 +1186,12 @@
     if (isGlobal && !d.enabled) {
       notices.push(notice("warn", t("globalOffNotice")));
     }
+    if (isPeople && !d.enabled) {
+      notices.push(notice("warn", t("peopleOffNotice")));
+    }
 
     const tabs = [["memories", "tabMemories", d.files.length], ["index", "tabIndex", null]];
-    if (!isGlobal) {
+    if (isSession) {
       tabs.push(["compression", "tabCompression", null]);
       tabs.push(["archives", "tabArchives", d.archiveCount || 0]);
     }
@@ -1286,7 +1334,7 @@
         { class: "file-item-top" },
         h("span", { class: "file-name" }, f.file),
         typeTag(f.type),
-        h("span", { class: "file-age", title: fmtTime(f.mtime) }, relTime(f.mtime))
+        h("span", { class: "file-age", title: fmtTime(f.updated || f.mtime) }, relTime(f.updated || f.mtime))
       ),
       h(
         "div",
@@ -1332,7 +1380,7 @@
         return f.type === state.typeFilter;
       })
       .sort(function (a, b) {
-        return b.mtime - a.mtime;
+        return (b.updated || b.mtime) - (a.updated || a.mtime);
       });
     if (!shown.length) {
       list.append(h("div", { class: "empty" }, h("span", null, t("noTypeMatch"))));
@@ -1571,7 +1619,7 @@
     const foot = h(
       "div",
       { class: "editor-foot" },
-      h("span", { class: "hint" }, ed.isNew ? t("newHint") : t("savedAt", { time: fmtTime(ed.baseMtime) })),
+      h("span", { class: "hint" }, editorStampLine(ed)),
       h(
         "div",
         { class: "actions" },
@@ -1581,6 +1629,21 @@
       )
     );
     box.append(h("div", { class: "panel-head" }, els.editorTitle, modes), body, foot);
+  }
+
+  // 编辑器底部的一行：首次记于 / 最近更新 / 来源 ID；老文件没有戳时退回 mtime
+  function editorStampLine(ed) {
+    if (ed.isNew) {
+      return t("newHint");
+    }
+    if (!ed.created && !ed.updated) {
+      return t("savedAt", { time: fmtTime(ed.baseMtime) });
+    }
+    let line = t("stampLine", { created: ed.created || "?", updated: ed.updated || "?" });
+    if (ed.source) {
+      line += " · " + t("sourceLine", { ids: ed.source });
+    }
+    return line;
   }
 
   function editorFromFile(data) {
@@ -1594,6 +1657,9 @@
       body: data.hasFrontmatter ? data.body || "" : String(data.content || "").trim(),
       content: data.content || "",
       baseMtime: data.mtime || 0,
+      created: data.created || "",
+      updated: data.updated || "",
+      source: data.source || "",
       hasFrontmatter: Boolean(data.hasFrontmatter),
       dirty: false,
     };
@@ -2343,6 +2409,14 @@
     const targets = [];
     if (ov.global.enabled && ov.global.fileCount > 0) {
       targets.push({ scope: "global", key: "", label: t("globalTitle"), sub: t("globalSub") });
+    }
+    const people = ov.people || { enabled: false, platforms: [] };
+    if (people.enabled) {
+      people.platforms
+        .filter(function (p) { return p.fileCount > 0; })
+        .forEach(function (p) {
+          targets.push({ scope: "people", key: p.key, label: t("peopleTitle", { platform: p.platform }), sub: t("peopleSub") });
+        });
     }
     ov.sessions
       .filter(function (s) { return s.fileCount > 0; })
