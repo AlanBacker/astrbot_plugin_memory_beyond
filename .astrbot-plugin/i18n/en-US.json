@@ -64,7 +64,11 @@
     },
     "summary_prompt_template": {
       "description": "Custom summary prompt template",
-      "hint": "Leave empty to use the built-in structured summary template. Placeholders: {previous_summary} for the existing summary and {transcript} for the conversation to compress. A broken template falls back to the built-in one."
+      "hint": "Leave empty to use the built-in summary template. Placeholders: {previous_summary} for the existing summary, {transcript} for the conversation to compress, {now} for the current time and {max_chars} for the summary length limit. A broken template falls back to the built-in one."
+    },
+    "summary_max_chars": {
+      "description": "Summary length limit (characters)",
+      "hint": "Asks the summary model to keep the rolling summary within this many characters; outdated and resolved items are dropped on each roll so the summary does not keep growing. The summary is sent with every request, so a larger limit means more fixed cost per turn. Default 1500."
     },
     "extract_memories": {
       "description": "Extract memories while compressing",

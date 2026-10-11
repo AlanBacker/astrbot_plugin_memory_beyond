@@ -117,6 +117,35 @@ def test_build_summary_prompt_default_template():
     prompt = build_summary_prompt("", "旧摘要", "对话转写", extract_memories=False)
     assert "旧摘要" in prompt and "对话转写" in prompt
     assert "<memories>" not in prompt
+    # 时间与字数占位符都已替换，缺省给出默认上限
+    assert "{now}" not in prompt and "{max_chars}" not in prompt
+    assert f"不超过 {prompts.SUMMARY_MAX_CHARS_DEFAULT} 字" in prompt
+    assert "现在是 （未知）" in prompt
+
+
+def test_build_summary_prompt_now_and_max_chars():
+    prompt = build_summary_prompt(
+        "", "", "t", extract_memories=False, now="2026-10-11 周日 14:30", max_chars=800
+    )
+    assert "现在是 2026-10-11 周日 14:30" in prompt and "不超过 800 字" in prompt
+    custom = build_summary_prompt(
+        "现在 {now}，上限 {max_chars}：{transcript}", "", "t",
+        extract_memories=False, now="T", max_chars=5,
+    )
+    assert custom == "现在 T，上限 5：t"
+
+
+def test_format_time_has_date_weekday_clock():
+    text = prompts.format_time(1760000000.0)
+    date, weekday, clock = text.split(" ")
+    assert len(date) == 10 and date.count("-") == 2
+    assert weekday[0] == "周" and weekday[1] in "一二三四五六日"
+    assert len(clock) == 5 and clock[2] == ":"
+
+
+def test_summary_message_marks_time_when_known():
+    assert "写于 " in build_summary_message("s", compressed_at=1760000000.0)["content"]
+    assert "写于" not in build_summary_message("s")["content"]
 
 
 def test_build_summary_prompt_extract_appended():

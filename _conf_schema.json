@@ -91,8 +91,14 @@
   "summary_prompt_template": {
     "description": "自定义摘要提示词模板",
     "type": "text",
-    "hint": "留空使用内置的结构化摘要模板。可用占位符：{previous_summary} 已有摘要、{transcript} 待压缩对话。模板损坏时自动回退内置模板。",
+    "hint": "留空使用内置的摘要模板。可用占位符：{previous_summary} 已有摘要、{transcript} 待压缩对话、{now} 当前时间、{max_chars} 摘要字数上限。模板损坏时自动回退内置模板。",
     "default": ""
+  },
+  "summary_max_chars": {
+    "description": "摘要字数上限",
+    "type": "int",
+    "hint": "提示摘要模型把滚动摘要控制在这么多字以内；滚动时过时和已解决的内容会被去掉，摘要不会越滚越长。摘要每轮都随请求发送，上限越大每轮固定开销越高。默认 1500。",
+    "default": 1500
   },
   "extract_memories": {
     "description": "压缩时联动提取记忆",

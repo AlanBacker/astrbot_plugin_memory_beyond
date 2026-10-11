@@ -595,7 +595,9 @@ class MemoryBeyondPlugin(Star):
 
         # ---- 拼装发送视图：system 消息 + 索引块 + 摘要块 + 原文尾部 + 召回块 ----
         summary_msg = (
-            prompts.build_summary_message(state.summary) if state.summary else None
+            prompts.build_summary_message(state.summary, state.compressed_at)
+            if state.summary
+            else None
         )
         view = list(contexts[:n_system])
         if index_msg:
@@ -923,12 +925,17 @@ class MemoryBeyondPlugin(Star):
             existing, updatable = await self._existing_for_extract(
                 self._store.session_scope(umo), transcript
             )
+        max_chars = max(
+            200, self._int("summary_max_chars", prompts.SUMMARY_MAX_CHARS_DEFAULT)
+        )
         prompt = prompts.build_summary_prompt(
             self._str("summary_prompt_template"),
             state.summary,
             transcript,
             extract,
             existing,
+            now=prompts.format_time(now),
+            max_chars=max_chars,
         )
         text, attempts_log = await self._call_summarizer(umo, prompt)
         if text:
@@ -959,6 +966,13 @@ class MemoryBeyondPlugin(Star):
             f"（共 {len(contexts)} 条），压缩前估算 {total_estimate} tokens，"
             f"摘要 {len(state.summary)} 字"
         )
+        if len(state.summary) > 2 * max_chars:
+            logger.warning(
+                LOG_PREFIX
+                + f"会话 {umo} 的摘要 {len(state.summary)} 字，远超 summary_max_chars"
+                f"（{max_chars}）：摘要模型没守住字数上限，每轮都要多带这些内容；"
+                "可考虑换摘要模型或调大上限"
+            )
         await self._archive_compressed(umo, state, plan.to_summarize)
 
         if extract and drafts:
@@ -1371,7 +1385,9 @@ class MemoryBeyondPlugin(Star):
             "tools": tools_cost,
             "index": index_cost,
             "summary": (
-                estimator.messages([prompts.build_summary_message(state.summary)])
+                estimator.messages(
+                    [prompts.build_summary_message(state.summary, state.compressed_at)]
+                )
                 if state.summary
                 else 0
             ),
