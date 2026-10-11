@@ -414,6 +414,7 @@ def test_consolidate_preview_and_apply(plugin, dash):
     data = ok(call(dash, "consolidate/preview", body={"scope": "session", "key": KEY}))
     assert [op["file"] for op in data["operations"]] == ["user-1.md", "user-1-old.md"]
     assert data["fileCount"] == 2 and data["skipped"] == []
+    assert data["files"] == ["user-1-old.md", "user-1.md"]
     assert "「开黑群」" in plugin.prompts[0]
 
     result = ok(

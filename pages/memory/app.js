@@ -178,6 +178,28 @@
     consolidateNothingHint: "模型认为这里的记忆已经很整齐了。",
     consolidateReview: "模型给出了下面的修改方案。勾选要应用的项目：写入会整文件覆盖，删除会同时移除索引行；应用时先写后删。",
     consolidateSkipped: "记忆太多，有 {n} 个文件没有参与这次整理。",
+    consolidateAll: "整理全部记忆",
+    consolidateAllHint: "让模型逐个复盘每个会话和全局的记忆，方案汇总在一处，由你勾选确认后才写入。",
+    consolidateAllTitle: "整理全部记忆",
+    consolidateAllNone: "还没有可整理的记忆",
+    consolidateAllIntro: "下面 {n} 处有记忆。会逐个让模型复盘，每处通常要几十秒，同时最多跑 2 处；模型只给出修改方案，跑完后由你勾选确认，确认前不会改动任何文件。",
+    start: "开始",
+    batchWaiting: "等待",
+    batchRunning: "复盘中…",
+    batchNothing: "无需整理",
+    batchFailed: "失败",
+    batchSkipped: "未跑",
+    batchProposed: "{n} 项方案",
+    consolidateAllStop: "停止，先看已有方案",
+    consolidateAllProgress: "已完成 {done} / {total}",
+    consolidateAllReview: "{n} 处有修改方案，{clean} 处无需整理。勾选要应用的项目：写入会整文件覆盖，删除会同时移除索引行；每处先写后删。",
+    consolidateAllFailed: "{n} 处复盘失败，这次没有方案：",
+    consolidateAllNothingTitle: "没有要改的",
+    consolidateAllNothingHint: "模型认为这些记忆都已经很整齐了。",
+    consolidateAllApplying: "正在应用：{name}",
+    consolidateAllDone: "整理完成：应用 {ok} 项，失败 {failed} 项。",
+    batchApplied: "应用 {n} 项",
+    batchPartial: "应用 {ok} 项，失败 {failed} 项",
     opCreate: "新建",
     opRewrite: "改写",
     opDelete: "删除",
@@ -842,7 +864,12 @@
           "div",
           { class: "brand" },
           h("div", null, h("h1", null, t("title")), h("p", null, t("subtitle"))),
-          h("button", { class: "btn ghost icon-only", title: t("refresh"), onclick: refreshAll }, icon("refresh"))
+          h(
+            "div",
+            { class: "brand-actions" },
+            h("button", { class: "btn ghost icon-only", title: t("consolidateAll"), onclick: consolidateAll }, icon("sparkles")),
+            h("button", { class: "btn ghost icon-only", title: t("refresh"), onclick: refreshAll }, icon("refresh"))
+          )
         ),
         h("div", { class: "search-box" }, icon("search"), els.filterInput),
         els.filterChips
@@ -1030,6 +1057,19 @@
       if (!ov.memoryEnabled) {
         box.append(notice("warn", t("memoryOffNotice")));
       }
+      box.append(
+        h(
+          "div",
+          { class: "panel action-panel" },
+          h("div", { class: "action-text" }, h("strong", null, t("consolidateAll")), h("span", null, t("consolidateAllHint"))),
+          h(
+            "button",
+            { class: "btn primary", onclick: consolidateAll, disabled: !consolidateTargets().length },
+            icon("sparkles"),
+            t("consolidateAll")
+          )
+        )
+      );
     }
     box.append(h("div", { class: "panel", style: "margin-top:16px" }, emptyState("inbox", t("welcomeTitle"), t("welcomeHint"))));
     return box;
@@ -2205,53 +2245,10 @@
       applyBtn.disabled = n === 0;
     }
     const rows = ops.map(function (op, i) {
-      const kind =
-        op.op === "delete"
-          ? ["danger", t("opDelete")]
-          : existing.has(op.file)
-            ? ["warn", t("opRewrite")]
-            : ["ok", t("opCreate")];
-      const box = h("input", {
-        type: "checkbox",
-        checked: true,
-        onchange: function (event) {
-          checks[i] = event.target.checked;
-          updateCounter();
-        },
+      return opRow(op, existing, function (checked) {
+        checks[i] = checked;
+        updateCounter();
       });
-      return h(
-        "div",
-        { class: "op" },
-        box,
-        h(
-          "div",
-          { style: "min-width:0" },
-          h(
-            "label",
-            {
-              class: "op-head",
-              onclick: function (event) {
-                if (event.target !== box) {
-                  box.click();
-                  event.preventDefault();
-                }
-              },
-            },
-            h("span", { class: "tag " + kind[0] }, kind[1]),
-            h("span", { class: "file-name", style: "flex:none" }, op.file),
-            op.op === "write" ? typeTag(op.type) : null
-          ),
-          op.reason ? h("div", { class: "op-reason" }, op.reason) : null,
-          op.op === "write"
-            ? h(
-                "details",
-                null,
-                h("summary", null, t("previewContent")),
-                h("pre", { class: "pre" }, composeMemory(stem(op.file), op.description, op.type, op.content))
-              )
-            : null
-        )
-      );
     });
     ctrl.setBody([
       h("p", null, t("consolidateReview")),
@@ -2285,6 +2282,312 @@
       }
     });
     ctrl.setFoot([counter, h("button", { class: "btn", onclick: function () { ctrl.close(null); } }, t("cancel")), applyBtn]);
+    updateCounter();
+  }
+
+  function opRow(op, existing, onToggle) {
+    const kind =
+      op.op === "delete"
+        ? ["danger", t("opDelete")]
+        : existing.has(op.file)
+          ? ["warn", t("opRewrite")]
+          : ["ok", t("opCreate")];
+    const box = h("input", {
+      type: "checkbox",
+      checked: true,
+      onchange: function (event) {
+        onToggle(event.target.checked);
+      },
+    });
+    return h(
+      "div",
+      { class: "op" },
+      box,
+      h(
+        "div",
+        { style: "min-width:0" },
+        h(
+          "label",
+          {
+            class: "op-head",
+            onclick: function (event) {
+              if (event.target !== box) {
+                box.click();
+                event.preventDefault();
+              }
+            },
+          },
+          h("span", { class: "tag " + kind[0] }, kind[1]),
+          h("span", { class: "file-name", style: "flex:none" }, op.file),
+          op.op === "write" ? typeTag(op.type) : null
+        ),
+        op.reason ? h("div", { class: "op-reason" }, op.reason) : null,
+        op.op === "write"
+          ? h(
+              "details",
+              null,
+              h("summary", null, t("previewContent")),
+              h("pre", { class: "pre" }, composeMemory(stem(op.file), op.description, op.type, op.content))
+            )
+          : null
+      )
+    );
+  }
+
+  // 所有有记忆的作用域：全局（开启时）在前，会话按最近活跃排序
+  function consolidateTargets() {
+    const ov = state.overview;
+    if (!ov) {
+      return [];
+    }
+    const targets = [];
+    if (ov.global.enabled && ov.global.fileCount > 0) {
+      targets.push({ scope: "global", key: "", label: t("globalTitle"), sub: t("globalSub") });
+    }
+    ov.sessions
+      .filter(function (s) { return s.fileCount > 0; })
+      .sort(function (a, b) {
+        return Math.max(b.lastActive, b.updatedAt) - Math.max(a.lastActive, a.updatedAt);
+      })
+      .forEach(function (s) {
+        targets.push({ scope: "session", key: s.key, label: sessionTitle(s), sub: sessionSub(s) });
+      });
+    return targets;
+  }
+
+  function sameScope(a, b) {
+    return !!a && !!b && a.scope === b.scope && (a.key || "") === (b.key || "");
+  }
+
+  async function consolidateAll() {
+    if (!(await confirmDiscard())) {
+      return;
+    }
+    const targets = consolidateTargets();
+    if (!targets.length) {
+      toast(t("consolidateAllNone"));
+      return;
+    }
+    const PARALLEL = 2;
+    const ctrl = openDialog({ title: t("consolidateAllTitle"), wide: true });
+    const statusEls = targets.map(function () { return h("span", { class: "tag" }, t("batchWaiting")); });
+    const list = h(
+      "div",
+      { class: "batch-list" },
+      targets.map(function (tg, i) {
+        return h(
+          "div",
+          { class: "batch-row" },
+          h("div", { class: "batch-text" }, h("div", { class: "batch-name" }, tg.label), tg.sub ? h("div", { class: "batch-sub" }, tg.sub) : null),
+          statusEls[i]
+        );
+      })
+    );
+    function setStatus(i, cls, text) {
+      statusEls[i].className = "tag" + (cls ? " " + cls : "");
+      statusEls[i].textContent = text;
+    }
+    function closeBtn(label) {
+      return h("button", { class: "btn", onclick: function () { ctrl.close(null); } }, label);
+    }
+
+    // 第一步：列出要跑的作用域，确认后开始
+    ctrl.setBody([h("p", null, t("consolidateAllIntro", { n: targets.length })), list]);
+    const startBtn = h("button", { class: "btn primary" }, t("start"));
+    ctrl.setFoot([closeBtn(t("cancel")), startBtn]);
+    await new Promise(function (resolve) {
+      startBtn.addEventListener("click", resolve);
+      ctrl.done.then(resolve);
+    });
+    if (!ctrl.isOpen()) {
+      return;
+    }
+
+    // 第二步：逐个预览，最多同时跑 PARALLEL 个；"停止"只是不再开新的
+    let stopped = false;
+    let next = 0;
+    let finished = 0;
+    const results = targets.map(function () { return null; });
+    const progress = h("span", { class: "grow" });
+    function updateProgress() {
+      progress.textContent = t("consolidateAllProgress", { done: finished, total: targets.length });
+    }
+    const stopBtn = h(
+      "button",
+      {
+        class: "btn",
+        onclick: function () {
+          stopped = true;
+          stopBtn.disabled = true;
+        },
+      },
+      t("consolidateAllStop")
+    );
+    ctrl.setFoot([progress, closeBtn(t("cancel")), stopBtn]);
+    updateProgress();
+    async function worker() {
+      while (!stopped && next < targets.length && ctrl.isOpen()) {
+        const i = next++;
+        const tg = targets[i];
+        setStatus(i, "", t("batchRunning"));
+        try {
+          const res = await apiPost("consolidate/preview", { scope: tg.scope, key: tg.key });
+          const ops = res.operations || [];
+          results[i] = { ops: ops, existing: new Set(res.files || []), skipped: res.skipped || [] };
+          setStatus(i, ops.length ? "warn" : "ok", ops.length ? t("batchProposed", { n: ops.length }) : t("batchNothing"));
+        } catch (err) {
+          results[i] = { error: err.message };
+          setStatus(i, "danger", t("batchFailed") + "：" + err.message);
+        }
+        finished++;
+        updateProgress();
+      }
+    }
+    const workers = [];
+    for (let k = 0; k < Math.min(PARALLEL, targets.length); k++) {
+      workers.push(worker());
+    }
+    await Promise.all(workers);
+    if (!ctrl.isOpen()) {
+      return;
+    }
+    targets.forEach(function (tg, i) {
+      if (!results[i]) {
+        setStatus(i, "", t("batchSkipped"));
+      }
+    });
+
+    // 第三步：汇总方案，按作用域分组勾选
+    const groups = [];
+    const failed = [];
+    let clean = 0;
+    targets.forEach(function (tg, i) {
+      const r = results[i];
+      if (!r) {
+        return;
+      }
+      if (r.error) {
+        failed.push(tg.label + "：" + r.error);
+      } else if (!r.ops.length) {
+        clean++;
+      } else {
+        groups.push({ tg: tg, ops: r.ops, existing: r.existing, skipped: r.skipped, checks: r.ops.map(function () { return true; }) });
+      }
+    });
+    const failedNotice = failed.length
+      ? notice(
+          "warn",
+          h(
+            "div",
+            null,
+            h("div", null, t("consolidateAllFailed", { n: failed.length })),
+            failed.map(function (line) { return h("div", null, line); })
+          )
+        )
+      : null;
+    const total = groups.reduce(function (n, g) { return n + g.ops.length; }, 0);
+    if (!total) {
+      ctrl.setBody([failedNotice, emptyState("check", t("consolidateAllNothingTitle"), t("consolidateAllNothingHint"))]);
+      ctrl.setFoot(h("button", { class: "btn primary", onclick: function () { ctrl.close(null); } }, t("close")));
+      return;
+    }
+    const counter = h("span", { class: "grow" });
+    const applyBtn = h("button", { class: "btn primary" }, t("applySelected"));
+    function updateCounter() {
+      const n = groups.reduce(function (sum, g) { return sum + g.checks.filter(Boolean).length; }, 0);
+      counter.textContent = t("selectedCount", { n: n, total: total });
+      applyBtn.disabled = n === 0;
+    }
+    const body = [h("p", null, t("consolidateAllReview", { n: groups.length, clean: clean })), failedNotice];
+    groups.forEach(function (g) {
+      body.push(
+        h(
+          "div",
+          { class: "batch-group" },
+          h("div", { class: "batch-group-head" }, h("strong", null, g.tg.label), h("span", null, t("batchProposed", { n: g.ops.length }))),
+          g.skipped.length ? notice("warn", t("consolidateSkipped", { n: g.skipped.length })) : null,
+          h(
+            "div",
+            null,
+            g.ops.map(function (op, i) {
+              return opRow(op, g.existing, function (checked) {
+                g.checks[i] = checked;
+                updateCounter();
+              });
+            })
+          )
+        )
+      );
+    });
+    ctrl.setBody(body);
+
+    // 第四步：逐个作用域应用，最后列出结果
+    applyBtn.addEventListener("click", async function () {
+      ctrl.busy = true;
+      applyBtn.disabled = true;
+      const outcome = [];
+      const touched = [];
+      let okCount = 0;
+      let failCount = 0;
+      for (const g of groups) {
+        const chosen = g.ops.filter(function (op, i) { return g.checks[i]; });
+        if (!chosen.length) {
+          continue;
+        }
+        counter.textContent = t("consolidateAllApplying", { name: g.tg.label });
+        try {
+          const result = await apiPost("consolidate/apply", { scope: g.tg.scope, key: g.tg.key, operations: chosen });
+          const items = result.results || [];
+          const bad = items.filter(function (item) { return !item.ok; });
+          okCount += items.length - bad.length;
+          failCount += bad.length;
+          outcome.push({ tg: g.tg, ok: items.length - bad.length, bad: bad });
+          touched.push(g.tg);
+        } catch (err) {
+          failCount += chosen.length;
+          outcome.push({ tg: g.tg, ok: 0, bad: [{ file: "", message: err.message }] });
+        }
+      }
+      ctrl.busy = false;
+      ctrl.setBody([
+        h("p", null, t("consolidateAllDone", { ok: okCount, failed: failCount })),
+        h(
+          "div",
+          { class: "batch-list" },
+          outcome.map(function (o) {
+            const detail = o.bad
+              .map(function (b) { return (b.file ? b.file + "：" : "") + b.message; })
+              .join("；");
+            return h(
+              "div",
+              { class: "batch-row" },
+              h(
+                "div",
+                { class: "batch-text" },
+                h("div", { class: "batch-name" }, o.tg.label),
+                detail ? h("div", { class: "batch-sub", title: detail }, detail) : null
+              ),
+              h(
+                "span",
+                { class: "tag " + (o.bad.length ? "danger" : "ok") },
+                o.bad.length ? t("batchPartial", { ok: o.ok, failed: o.bad.length }) : t("batchApplied", { n: o.ok })
+              )
+            );
+          })
+        ),
+      ]);
+      ctrl.setFoot(h("button", { class: "btn primary", onclick: function () { ctrl.close(true); } }, t("close")));
+      const selTouched = touched.some(function (tg) { return sameScope(tg, state.selected); });
+      if (selTouched) {
+        state.editor = null;
+        state.fileQuery = "";
+        state.searchResults = null;
+        await Promise.all([loadDetail(), loadOverview(true)]);
+      } else {
+        await loadOverview(true);
+      }
+    });
+    ctrl.setFoot([counter, closeBtn(t("cancel")), applyBtn]);
     updateCounter();
   }
 

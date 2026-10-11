@@ -1213,3 +1213,98 @@ svg.icon {
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+/* 整理全部记忆：进度列表与分组方案 */
+.brand-actions {
+  display: flex;
+  gap: 2px;
+  flex: none;
+}
+
+.action-panel {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-top: 16px;
+}
+
+.action-text {
+  flex: 1;
+  min-width: 200px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.action-text span {
+  color: var(--text-2);
+  font-size: 13px;
+}
+
+.batch-list {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  max-height: 44vh;
+  overflow: auto;
+}
+
+.batch-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.batch-row:last-child {
+  border-bottom: 0;
+}
+
+.batch-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.batch-name,
+.batch-sub {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.batch-name {
+  font-weight: 500;
+}
+
+.batch-sub {
+  color: var(--text-2);
+  font-size: 12px;
+}
+
+.batch-row .tag {
+  flex: none;
+  max-width: 50%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.batch-group {
+  margin-top: 18px;
+}
+
+.batch-group-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding-bottom: 6px;
+  border-bottom: 2px solid var(--line);
+}
+
+.batch-group-head span {
+  color: var(--text-2);
+  font-size: 12px;
+}

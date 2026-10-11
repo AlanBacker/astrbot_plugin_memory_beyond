@@ -593,6 +593,7 @@ class MemoryDashboard:
                     "operations": [op.to_dict() for op in ops],
                     "skipped": skipped,
                     "fileCount": len(files),
+                    "files": sorted(existing),
                 }
             )
         finally:
