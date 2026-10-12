@@ -35,10 +35,11 @@ _OPERATIONS_RE = re.compile(r"<operations>(.*?)</operations>", re.S | re.I)
 _FENCE_RE = re.compile(r"^```[a-zA-Z]*\n?|```$", re.M)
 _SAFE_FILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,120}\.md$")
 
-CONSOLIDATE_PROMPT = """你是聊天机器人的记忆整理助手。下面是记忆库「{scope_label}」里的全部记忆文件（每个文件标注了最近写入时间）。请像整理笔记一样做一次复盘：
+CONSOLIDATE_PROMPT = """你是聊天机器人的记忆整理助手。下面是记忆库「{scope_label}」里的全部记忆文件（每个文件标注了最近写入时间与最近被用到的时间）。请像整理笔记一样做一次复盘：
 
 - 合并重复：同一个人（同一个数字 ID）或同一件事分散在几个文件里的，合并进一个文件——记人的文件统一命名为 user-<数字ID>.md——并删除其余文件；
 - 修正过时与矛盾：同一事实前后矛盾时以较新的为准，删去明显已失效的内容；正文里的相对日期（明天、下周）按写入时间换算成绝对日期；
+- 精简：长期没被用到、内容又明显只是一次性的条目（如早已过去的临时安排）可以删除；有长期价值的即使没用过也保留；
 - 规范格式：type 只能是 user、feedback、project、reference 之一；description 写成一句能让人判断"何时该读全文"的钩子；feedback 与 project 类正文附 **Why:** 与 **How to apply:** 两行；
 - 不编造：只能重组、精简、改写已有信息，不得添加文件里没有的事实；
 - 拿不准的不动。不需要整理就输出空数组。
@@ -96,12 +97,20 @@ def build_prompt(
             continue
         used += len(content)
         blocks.append(
-            f"=== {header.file}（{age_label(header.updated, now)}写入）===\n{content.strip()}"
+            f"=== {header.file}（{age_label(header.updated, now)}写入，"
+            f"{usage_label(header, now)}）===\n{content.strip()}"
         )
     prompt = CONSOLIDATE_PROMPT.format(
         scope_label=scope_label, files="\n\n".join(blocks) or "（空）"
     )
     return prompt, skipped
+
+
+def usage_label(header: MemoryHeader, now: float | None = None) -> str:
+    """整理清单里的使用情况：模型据此判断哪些记忆长期没派上用场。"""
+    if header.last_used <= 0:
+        return "从未被用到"
+    return f"最近用到于{age_label(header.last_used, now)}"
 
 
 def _load_array(text: str):

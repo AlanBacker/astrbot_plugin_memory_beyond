@@ -57,6 +57,9 @@ SCOPE_ARG_ERROR = "scope 参数必须是 global、session 或 people。"
 MAX_RUNTIME_SESSIONS = 256
 # 模型挑选召回记忆时的单次超时：挑选在回复之前完成，等太久不如退回关键词
 RECALL_SELECT_TIMEOUT = 15
+# 遗忘扫描：每个作用域目录至多每隔这么久扫一次（秒）；默认多久没用到算遗忘（天）
+FORGET_SWEEP_INTERVAL = 6 * 3600
+FORGET_DEFAULT_DAYS = 90
 
 # 自动探测模型上下文窗口的对照表：子串匹配，先命中先用。
 # 探测只是兜底，README 中明确建议手动配置 max_context_tokens。
@@ -143,6 +146,8 @@ class MemoryBeyondPlugin(Star):
         self._sessions: OrderedDict[str, RuntimeSession] = OrderedDict()
         self._tasks: set[asyncio.Task] = set()
         self._warned_threshold = False
+        # 作用域目录 -> 上次遗忘扫描时间
+        self._last_sweep: dict[Path, float] = {}
         self.dashboard = MemoryDashboard(self)
         self.dashboard.register()
 
@@ -397,6 +402,20 @@ class MemoryBeyondPlugin(Star):
         该平台的所有会话共享；关闭时各会话各记各的，已有文件原样保留。"""
         return self._bool("enable_people_memory", False)
 
+    def _forgetting_on(self) -> bool:
+        """记忆遗忘开关，默认关闭。开启后长期没被召回或读取的记忆移出索引与
+        召回（文件保留在 forgotten/ 下），再被用到时自动恢复；关闭时什么都不动，
+        使用统计照常记录。"""
+        return self._bool("enable_forgetting", False)
+
+    def _forget_after_days(self) -> int:
+        return max(1, self._int("forget_after_days", FORGET_DEFAULT_DAYS))
+
+    def _guidance(self) -> str:
+        return prompts.memory_guidance(
+            self._global_on(), self._people_on(), self._forgetting_on()
+        )
+
     @staticmethod
     def _platform_of(umo: str) -> str:
         platform, _, _ = registry.parse_umo(umo)
@@ -526,6 +545,8 @@ class MemoryBeyondPlugin(Star):
         # ---- 后台定期提取：每隔 N 轮把最近的对话交给模型补记长期事实 ----
         if memory_on:
             self._maybe_extract(rt, umo, contexts, n_system, now)
+            # ---- 遗忘扫描：长期没用到的记忆退出索引与召回（后台，按目录节流） ----
+            self._maybe_forget(umo, now)
 
         # ---- 记忆索引块（对话内快照；新对话、压缩后、WebUI 改动后从磁盘刷新） ----
         index_msg = None
@@ -537,7 +558,7 @@ class MemoryBeyondPlugin(Star):
             # ---- 相关记忆召回：本轮用得上的记忆全文附在新消息之前 ----
             recall_msg = await self._recall_message(event, umo, query)
 
-        guidance = prompts.memory_guidance(self._global_on(), self._people_on()) if memory_on else ""
+        guidance = self._guidance() if memory_on else ""
         estimator = tokens.TokenEstimator(state.ratio)
 
         overhead = (
@@ -740,6 +761,13 @@ class MemoryBeyondPlugin(Star):
                 scopes.append(("global", self._global_scope()))
             if self._people_on():
                 scopes.append(("people", self._people_scope(umo)))
+            query = prompts.strip_sender_tag(query)
+            sender_id, _ = self._sender_identity(event)
+            forced = recall.identity_files(
+                sender_id, self._mentioned_ids(event), query
+            )
+            if forced and self._forgetting_on():
+                await self._remember_identity(scopes, forced)
             candidates: list[recall.Candidate] = []
             stores: dict[str, memstore.ScopeStore] = {}
             for label, store in scopes:
@@ -748,11 +776,6 @@ class MemoryBeyondPlugin(Star):
                     candidates.append(recall.Candidate(label, header))
             if not candidates:
                 return None
-            query = prompts.strip_sender_tag(query)
-            sender_id, _ = self._sender_identity(event)
-            forced = recall.identity_files(
-                sender_id, self._mentioned_ids(event), query
-            )
             chosen = None
             if mode == "llm" and query.strip():
                 # 人物文件只走身份必选，不让模型从别的群的人里挑
@@ -768,17 +791,89 @@ class MemoryBeyondPlugin(Star):
             if chosen is None:
                 chosen = recall.select_by_keywords(candidates, query, forced, limit)
             items: list[recall.Recalled] = []
+            used: dict[str, list[str]] = {}
             for cand in chosen:
                 content = await stores[cand.scope].read(cand.header.file)
                 if content:
                     items.append(
                         recall.Recalled(cand.ref, content, cand.header.updated)
                     )
+                    used.setdefault(cand.scope, []).append(cand.header.file)
+            # 被召回就算用到：使用统计是遗忘与整理的依据
+            for label, names in used.items():
+                await asyncio.to_thread(stores[label].note_used, names)
             block = recall.build_recall_block(items, prompts.DATA_NOTICE)
             return recall.build_recall_message(block) if block else None
         except Exception:  # noqa: BLE001 - 召回是锦上添花，失败不影响本轮
             logger.warning(LOG_PREFIX + f"会话 {umo} 相关记忆召回失败", exc_info=True)
             return None
+
+    async def _remember_identity(
+        self, scopes: list[tuple[str, memstore.ScopeStore]], forced: list[str]
+    ) -> None:
+        """身份必选的人物文件若已被遗忘，这个人又出现了——先恢复再召回。"""
+        for label, store in scopes:
+            if label not in recall.FORCED_SCOPES:
+                continue
+            for name in forced:
+                if store.exists(name) or not store.has_forgotten(name):
+                    continue
+                report = await store.restore(name)
+                if report.ok:
+                    logger.info(
+                        LOG_PREFIX + f"{label} 记忆 {name} 已从遗忘中恢复（此人再次出现）"
+                    )
+                else:
+                    logger.debug(LOG_PREFIX + f"恢复 {label}/{name} 失败：{report.message}")
+
+    # ============================================================ 遗忘
+
+    def _maybe_forget(self, umo: str, now: float) -> None:
+        """遗忘扫描：本会话涉及的每个作用域目录至多每隔一段时间扫一次，后台进行。"""
+        if not self._forgetting_on():
+            return
+        # (索引快照要作废的会话, 作用域)；None 作废全部会话（global 对所有会话可见），
+        # "" 不作废任何会话（people 没有索引注入）
+        targets: list[tuple[str | None, memstore.ScopeStore]] = [
+            (umo, self._store.session_scope(umo))
+        ]
+        if self._global_on():
+            targets.append((None, self._global_scope()))
+        if self._people_on():
+            targets.append(("", self._people_scope(umo)))
+        due = [
+            (key, store)
+            for key, store in targets
+            if now - self._last_sweep.get(store.root, 0.0) >= FORGET_SWEEP_INTERVAL
+        ]
+        if not due:
+            return
+        for _, store in due:
+            self._last_sweep[store.root] = now
+        self._spawn(self._forget_sweep(due, now), f"forget:{umo}")
+
+    async def _forget_sweep(
+        self, targets: list[tuple[str | None, memstore.ScopeStore]], now: float
+    ) -> int:
+        """对给定作用域做一次遗忘扫描，返回遗忘的文件总数。"""
+        max_idle = self._forget_after_days() * 86400.0
+        total = 0
+        for key, store in targets:
+            try:
+                forgotten = await store.forget_stale(max_idle, now)
+            except Exception:  # noqa: BLE001 - 遗忘失败不影响对话
+                logger.warning(LOG_PREFIX + f"遗忘扫描失败：{store.root}", exc_info=True)
+                continue
+            if not forgotten:
+                continue
+            total += len(forgotten)
+            logger.info(
+                LOG_PREFIX
+                + f"{store.root.parent.name}/{store.root.name} 遗忘了 {len(forgotten)} 条"
+                f"长期未用的记忆：{', '.join(forgotten)}"
+            )
+            self._invalidate_index_cache(key)
+        return total
 
     async def _select_by_model(
         self,
@@ -1083,10 +1178,13 @@ class MemoryBeyondPlugin(Star):
         *,
         attempts: int | None = None,
         timeout: int | None = None,
+        preferred_id: str = "",
     ) -> tuple[str | None, list[str]]:
         """按回退链调用摘要模型：配置的提供商（重试 N 次）→ 当前对话提供商。
 
         umo 为 None 时（WebUI 发起的整理）当前提供商取默认提供商。
+        preferred_id 是某类任务单独指定的提供商（如整理记忆），排在摘要提供商
+        之前；两者相同只试一次。
         attempts / timeout 不传时按配置；召回挑选这类要求快的调用只试一次。
         返回 (成功文本或 None, 尝试记录)。全部失败的兜底不在这里——由调用方
         决定（压缩记录失败进入退避冷却，召回退回关键词）。
@@ -1097,17 +1195,23 @@ class MemoryBeyondPlugin(Star):
         attempts_log: list[str] = []
 
         chain: list[tuple[str, object, int]] = []
-        configured_id = self._str("summary_provider_id").strip()
-        if configured_id:
+        wanted = [
+            ("专用提供商", (preferred_id or "").strip()),
+            ("摘要提供商", self._str("summary_provider_id").strip()),
+        ]
+        seen: set[str] = set()
+        for kind, configured_id in wanted:
+            if not configured_id or configured_id in seen:
+                continue
+            seen.add(configured_id)
             provider = await self._provider_by_id(configured_id)
             if provider is None:
-                attempts_log.append(f"配置的提供商 {configured_id} 未找到")
+                attempts_log.append(f"配置的{kind} {configured_id} 未找到")
                 logger.warning(
-                    LOG_PREFIX
-                    + f"配置的摘要提供商 {configured_id} 未找到，回退当前对话提供商"
+                    LOG_PREFIX + f"配置的{kind} {configured_id} 未找到，继续回退链"
                 )
-            else:
-                chain.append((f"配置提供商 {configured_id}", provider, retries))
+            elif all(provider is not p for _, p, _ in chain):
+                chain.append((f"{kind} {configured_id}", provider, retries))
         current = await self._current_provider(umo)
         if current is not None and all(current is not p for _, p, _ in chain):
             fallback = retries if not chain else min(retries, FALLBACK_ATTEMPTS)
@@ -1135,6 +1239,12 @@ class MemoryBeyondPlugin(Star):
     async def call_summarizer(self, prompt: str) -> tuple[str | None, list[str]]:
         """供 WebUI 使用的摘要模型调用（不绑定会话）。"""
         return await self._call_summarizer(None, prompt)
+
+    async def call_consolidator(self, prompt: str) -> tuple[str | None, list[str]]:
+        """管理页整理记忆用的模型调用：整理专用提供商优先，留空同摘要提供商。"""
+        return await self._call_summarizer(
+            None, prompt, preferred_id=self._str("consolidate_provider_id")
+        )
 
     @staticmethod
     async def _maybe_await(value):
@@ -1296,19 +1406,36 @@ class MemoryBeyondPlugin(Star):
         store, scope, refused = self._tool_store(event, scope)
         if store is None:
             return refused
+        file = (file or "").strip()
         content = await store.read(file)
+        restored = False
+        if content is None and self._forgetting_on() and store.has_forgotten(file):
+            # 模型主动读一条已遗忘的记忆：读取即恢复在册
+            report = await store.restore(file)
+            if report.ok:
+                content = await store.read(file)
+                restored = True
+                logger.info(LOG_PREFIX + f"{scope} 记忆 {file} 已从遗忘中恢复（模型读取）")
         if content is None:
             existing = store.list_files()
             listing = "、".join(existing) if existing else "（该作用域还没有记忆文件）"
             return f"文件 {file} 不存在。该作用域现有文件：{listing}"
-        if file.strip() != memstore.INDEX_FILENAME:
+        if file != memstore.INDEX_FILENAME:
+            if not restored:
+                # 恢复时已经记过一次使用
+                await asyncio.to_thread(store.note_used, [file])
             # 时效按 frontmatter 的 updated 戳算；老文件没有戳才退回 mtime
             written = memstore.parse_stamp(
                 memstore.parse_memory(content).updated
             ) or store.mtime(file)
+            notes = []
+            if restored:
+                notes.append("（这条记忆此前因长期未用已被遗忘，刚刚已恢复在册）")
             note = recall.freshness_note(written) if written else ""
             if note:
-                return f"{note}\n\n{content}"
+                notes.append(note)
+            if notes:
+                return "\n".join(notes) + f"\n\n{content}"
         return content
 
     @filter.llm_tool(name="memory_write")
@@ -1459,9 +1586,17 @@ class MemoryBeyondPlugin(Star):
         for label, store in stores:
             for hit in await store.search(query):
                 lines.append(f"[{label}] {hit}")
-        if not lines:
+        forgotten: list[str] = []
+        if self._forgetting_on():
+            for label, store in stores:
+                for hit in await store.search_forgotten(query):
+                    forgotten.append(f"[{label}·已遗忘] {hit}")
+        if not lines and not forgotten:
             return f"没有找到匹配「{query}」的记忆。"
-        return "搜索结果（用 memory_read 读取完整内容）：\n" + "\n".join(lines)
+        text = "搜索结果（用 memory_read 读取完整内容）：\n" + "\n".join(lines + forgotten)
+        if forgotten:
+            text += "\n标注「已遗忘」的是长期没用到而移出索引的记忆，用 memory_read 读取即自动恢复。"
+        return text
 
     # ============================================================ 管理指令
 
@@ -1524,9 +1659,7 @@ class MemoryBeyondPlugin(Star):
         parts = {
             "overhead": (
                 estimator.messages(contexts[:n_system])
-                + estimator.text(
-                    prompts.memory_guidance(self._global_on(), self._people_on()) if memory_on else ""
-                )
+                + estimator.text(self._guidance() if memory_on else "")
             ),
             "tools": tools_cost,
             "index": index_cost,
@@ -1563,6 +1696,7 @@ class MemoryBeyondPlugin(Star):
         )
         session_files = self._session_scope(event).list_files()
         configured_id = self._str("summary_provider_id").strip() or "（未配置，用当前对话提供商）"
+        tidy_id = self._str("consolidate_provider_id").strip() or "（未配置，同摘要提供商）"
 
         now = time.time()
         cooldown = (
@@ -1628,12 +1762,20 @@ class MemoryBeyondPlugin(Star):
                 else "提供商未上报"
             ),
             f"摘要提供商：{configured_id}",
+            f"整理提供商：{tidy_id}",
             f"摘要链路：{cooldown}",
             f"相关记忆召回：{self._recall_label()}",
             f"后台记忆提取：{self._extract_label(state)}",
+            f"记忆遗忘：{self._forget_label(umo)}",
             "记忆管理页：AstrBot WebUI 侧边栏「插件页面」",
         ]
         yield event.plain_result("\n".join(lines))
+
+    def _forget_label(self, umo: str) -> str:
+        if not self._forgetting_on():
+            return "关闭"
+        count = len(self._store.session_scope(umo).forgotten_files())
+        return f"{self._forget_after_days()} 天没用到即遗忘（本会话已遗忘 {count} 条）"
 
     def _recall_label(self) -> str:
         mode = self._str("recall_mode", "keyword").strip().lower()

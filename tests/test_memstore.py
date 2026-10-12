@@ -578,3 +578,112 @@ def test_people_scope_per_platform(tmp_path):
     assert not memstore.is_person_file("user-ajie.md")
     assert not memstore.is_person_file("project-x.md")
     assert not memstore.is_person_file("")
+
+
+# ---------------------------------------------------------------- 使用统计与遗忘
+
+DAY = 86400.0
+
+FEEDBACK_MD = (
+    "---\nname: rule\ndescription: 指导\nmetadata:\n  type: feedback\n---\n\n别这样。\n"
+)
+
+
+def test_note_used_records_usage_and_updates_headers(tmp_path):
+    store = ScopeStore(tmp_path)
+    run(store.write("a.md", memory_md("a", "钩子A")))
+    run(store.write("b.md", memory_md("b", "钩子B")))
+    assert {h.file: h.uses for h in store.headers()} == {"a.md": 0, "b.md": 0}
+    store.note_used(["a.md", "a.md", "MEMORY.md", "../x.md"], now=1000.0)
+    store.note_used(["a.md"], now=2000.0)
+    by_file = {h.file: h for h in store.headers()}
+    assert by_file["a.md"].uses == 2 and by_file["a.md"].last_used == 2000.0
+    assert by_file["b.md"].uses == 0 and by_file["b.md"].last_used == 0.0
+    assert by_file["a.md"].idle_since() == 2000.0
+    assert by_file["b.md"].idle_since() == by_file["b.md"].updated
+    assert store.usage_of("a.md").uses == 2
+    assert set(store.usage()) == {"a.md"}
+    assert (tmp_path / memstore.USAGE_FILENAME).is_file()
+    # 旁存文件不是记忆：不进清单、不进索引体检
+    assert store.list_files() == ["a.md", "b.md"]
+    assert store.index_report().missing == []
+    # 彻底删除后统计也不留
+    run(store.delete("a.md"))
+    assert store.usage() == {}
+    assert not (tmp_path / memstore.USAGE_FILENAME).exists()
+
+
+def test_forget_stale_moves_unused_files_and_keeps_feedback(tmp_path):
+    store = ScopeStore(tmp_path)
+    run(store.write("old.md", memory_md("old", "很久没用")))
+    run(store.write("fresh.md", memory_md("fresh", "刚用过")))
+    run(store.write("rule.md", FEEDBACK_MD))
+    now = time.time()
+    # 从没用过的按最近修改算：刚写入，不到期
+    assert run(store.forget_stale(30 * DAY, now)) == []
+    far = now + 100 * DAY
+    store.note_used(["fresh.md"], now=far - DAY)
+    assert run(store.forget_stale(30 * DAY, far)) == ["old.md"]
+    assert store.list_files() == ["fresh.md", "rule.md"]
+    assert store.forgotten_files() == ["old.md"]
+    assert store.has_forgotten("old.md") and not store.exists("old.md")
+    index = (tmp_path / INDEX_FILENAME).read_text("utf-8")
+    assert "](old.md)" not in index and "](fresh.md)" in index
+    assert [h.file for h in store.headers()] == ["fresh.md", "rule.md"]
+    forgotten = store.forgotten_headers()
+    assert [h.file for h in forgotten] == ["old.md"]
+    assert abs(forgotten[0].forgotten_at - far) < 0.002 and forgotten[0].description == "很久没用"
+    assert run(store.read("old.md")) is None
+    assert "很久没用" in run(store.read_forgotten("old.md"))
+    assert run(store.search("很久")) == []
+    assert run(store.search_forgotten("很久")) == ["old.md: description: 很久没用"]
+    # 再扫一次不会重复，也不会动已遗忘的
+    assert run(store.forget_stale(30 * DAY, far)) == []
+
+
+def test_restore_and_delete_forgotten(tmp_path):
+    store = ScopeStore(tmp_path)
+    run(store.write("old.md", memory_md("old", "钩子")))
+    assert not run(store.forget("MEMORY.md")).ok
+    assert not run(store.forget("nope.md")).ok
+    assert run(store.forget("old.md", now=5.0)).ok
+    assert store.forgotten_files() == ["old.md"]
+    assert store.usage_of("old.md").forgotten_at == 5.0
+    assert not run(store.restore("nope.md")).ok
+    report = run(store.restore("old.md", now=9.0))
+    assert report.ok and "索引行已同步" in report.message
+    assert store.list_files() == ["old.md"] and store.forgotten_files() == []
+    assert not (tmp_path / memstore.FORGOTTEN_DIRNAME).exists()
+    assert "](old.md)" in (tmp_path / INDEX_FILENAME).read_text("utf-8")
+    used = store.usage_of("old.md")
+    assert used.last_used == 9.0 and used.uses == 1 and used.forgotten_at == 0.0
+    # 同名在册时不能恢复
+    assert run(store.forget("old.md", now=10.0)).ok
+    (tmp_path / "old.md").write_text(memory_md("old", "手工放回"), "utf-8")
+    assert "仍在册" in run(store.restore("old.md")).message
+    assert run(store.delete_forgotten("old.md")).ok
+    assert store.forgotten_files() == [] and store.usage_of("old.md").forgotten_at == 0.0
+    assert not run(store.delete_forgotten("old.md")).ok
+
+
+def test_write_over_forgotten_name_supersedes_copy(tmp_path):
+    store = ScopeStore(tmp_path)
+    run(store.write("p.md", memory_md("p", "第一版")))
+    created = memstore.parse_memory(run(store.read("p.md"))).created
+    assert run(store.forget("p.md")).ok
+    run(store.write("p.md", memory_md("p", "第二版")))
+    assert store.forgotten_files() == [] and store.usage_of("p.md").forgotten_at == 0.0
+    doc = memstore.parse_memory(run(store.read("p.md")))
+    assert doc.created == created and doc.description == "第二版"
+    assert not (tmp_path / memstore.FORGOTTEN_DIRNAME).exists()
+
+
+def test_purge_removes_forgotten_and_usage(tmp_path):
+    store = ScopeStore(tmp_path)
+    run(store.write("a.md", memory_md("a", "A")))
+    run(store.write("b.md", memory_md("b", "B")))
+    store.note_used(["a.md"])
+    assert run(store.forget("b.md")).ok
+    assert run(store.purge()) == 1
+    assert not tmp_path.exists()
+    assert store.forgotten_files() == [] and store.usage() == {}

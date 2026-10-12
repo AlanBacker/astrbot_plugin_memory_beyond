@@ -101,6 +101,12 @@ class FakePlugin:
     def _people_on(self):
         return self.config["enable_people_memory"]
 
+    def _forgetting_on(self):
+        return self.config.get("enable_forgetting", False)
+
+    def _forget_after_days(self):
+        return self.config.get("forget_after_days", 90)
+
     def _bool(self, key, default):
         return self.config.get(key, default)
 
@@ -125,7 +131,7 @@ class FakePlugin:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(state.to_dict()), "utf-8")
 
-    async def call_summarizer(self, prompt):
+    async def call_consolidator(self, prompt):
         self.prompts.append(prompt)
         if not self.summarizer_reply:
             return "", ["provider-x: 超时"]
@@ -546,3 +552,50 @@ def test_people_scope_routes(plugin, dash):
     # 关闭后文件仍在、页面仍可看，只是标成未启用
     assert ok(call(dash, "scope", {"scope": "people", "key": "aiocqhttp"}))["enabled"] is False
     assert ok(call(dash, "overview"))["people"]["platforms"][0]["fileCount"] == 2
+
+
+# ---------------------------------------------------------------- 遗忘
+
+
+def test_forgotten_routes(plugin, dash):
+    plugin.config["enable_forgetting"] = True
+    plugin.config["forget_after_days"] = 30
+    store = session_store(plugin)
+    asyncio.run(store.write("a.md", memory("a", "钩子A")))
+    asyncio.run(store.write("b.md", memory("b", "钩子B")))
+    store.note_used(["a.md"], now=123.0)
+    q = {"scope": "session", "key": KEY}
+    detail = ok(call(dash, "scope", q))
+    assert detail["forgettingEnabled"] is True and detail["forgetAfterDays"] == 30
+    assert detail["forgotten"] == []
+    by_file = {f["file"]: f for f in detail["files"]}
+    assert by_file["a.md"]["uses"] == 1 and by_file["a.md"]["lastUsed"] == 123.0
+    assert by_file["b.md"]["uses"] == 0 and by_file["b.md"]["forgottenAt"] == 0
+    assert ok(call(dash, "file", {**q, "file": "a.md"}))["lastUsed"] == 123.0
+
+    ok(call(dash, "file/forget", body={**q, "file": "b.md"}))
+    assert plugin.invalidated[-1] == KEY
+    assert "不存在" in err(call(dash, "file", {**q, "file": "b.md"}))
+    detail = ok(call(dash, "scope", q))
+    assert [f["file"] for f in detail["files"]] == ["a.md"]
+    assert [f["file"] for f in detail["forgotten"]] == ["b.md"]
+    assert detail["forgotten"][0]["forgottenAt"] > 0
+    assert "](b.md)" not in detail["index"]["content"]
+    view = ok(call(dash, "forgotten/file", {**q, "file": "b.md"}))
+    assert "钩子B" in view["content"] and view["forgottenAt"] > 0
+    assert "没有已遗忘" in err(call(dash, "forgotten/file", {**q, "file": "a.md"}))
+
+    ok(call(dash, "forgotten/restore", body={**q, "file": "b.md"}))
+    detail = ok(call(dash, "scope", q))
+    assert [f["file"] for f in detail["files"]] == ["a.md", "b.md"]
+    assert detail["forgotten"] == [] and "](b.md)" in detail["index"]["content"]
+    assert "没有已遗忘" in err(call(dash, "forgotten/restore", body={**q, "file": "b.md"}))
+
+    ok(call(dash, "file/forget", body={**q, "file": "b.md"}))
+    ok(call(dash, "forgotten/delete", body={**q, "file": "b.md"}))
+    assert store.forgotten_files() == [] and store.list_files() == ["a.md"]
+    assert "没有已遗忘" in err(call(dash, "forgotten/delete", body={**q, "file": "b.md"}))
+    assert "索引" in err(call(dash, "file/forget", body={**q, "file": "MEMORY.md"}))
+    # 关闭开关：页面照样能看、能恢复，只是标成未启用
+    plugin.config["enable_forgetting"] = False
+    assert ok(call(dash, "scope", q))["forgettingEnabled"] is False

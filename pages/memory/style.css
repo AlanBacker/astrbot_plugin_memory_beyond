@@ -954,6 +954,34 @@ svg.icon {
   min-width: 0;
 }
 
+.forgotten-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.forgotten-item:last-child {
+  border-bottom: 0;
+}
+
+.forgotten-item .grow {
+  flex: 1;
+  min-width: 0;
+}
+
+.forgotten-item .session-sub {
+  margin-top: 4px;
+}
+
+@media (max-width: 720px) {
+  .forgotten-item {
+    flex-direction: column;
+    align-items: stretch;
+  }
+}
+
 .messages {
   display: grid;
   gap: 10px;

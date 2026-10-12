@@ -164,6 +164,24 @@
     noArchivesTitle: "还没有归档",
     noArchivesHint: "上下文压缩时，被摘要代替的原文会存在这里，方便核对摘要有没有漏掉什么。",
     archiveMeta: "{count} 条消息 · 摘要 {chars} 字",
+    tabForgotten: "已遗忘",
+    forgottenTitle: "已遗忘的记忆",
+    forgottenHint: "长期没被召回或读取的记忆会移到这里：不进索引、不参与召回，文件保留。这个人再出现、或机器人主动读它时会自动恢复。",
+    forgottenOffHint: "记忆遗忘当前未启用，这里只是之前遗忘下来的文件，不会再自动遗忘或恢复；可以手动恢复或彻底删除。",
+    noForgottenTitle: "没有已遗忘的记忆",
+    noForgottenHint: "超过 {days} 天没被召回或读取的记忆（指导类除外）会自动移到这里。",
+    forgottenAt: "{time} 遗忘",
+    usageLine: "最近用到 {time} · 共 {n} 次",
+    neverUsed: "还没被召回或读取过",
+    view: "查看",
+    restore: "恢复",
+    restored: "已恢复",
+    forget: "遗忘",
+    forgetTitle: "遗忘记忆",
+    forgetMessage: "把 {file} 移入已遗忘：它会退出索引与召回，文件保留，随时可以恢复。",
+    forgotten: "已遗忘",
+    forgetDeleteTitle: "彻底删除",
+    forgetDeleteMessage: "确定永久删除已遗忘的 {file} 吗？删除后无法恢复。",
     backToArchives: "返回归档列表",
     archiveSummary: "这次压缩生成的摘要",
     archiveMessages: "被摘要的原文（{n} 条）",
@@ -1195,6 +1213,10 @@
       tabs.push(["compression", "tabCompression", null]);
       tabs.push(["archives", "tabArchives", d.archiveCount || 0]);
     }
+    const forgotten = d.forgotten || [];
+    if (d.forgettingEnabled || forgotten.length) {
+      tabs.push(["forgotten", "tabForgotten", forgotten.length]);
+    }
     const tabBar = h("div", { class: "tabs", role: "tablist" });
     tabs.forEach(function (tab) {
       tabBar.append(
@@ -1241,6 +1263,8 @@
       body.append(renderCompressionTab());
     } else if (state.tab === "archives") {
       body.append(renderArchiveTab());
+    } else if (state.tab === "forgotten") {
+      body.append(renderForgottenTab());
     }
   }
 
@@ -1624,6 +1648,9 @@
         "div",
         { class: "actions" },
         ed.isNew ? null : h("button", { class: "btn danger", onclick: deleteFile }, icon("trash"), t("delete")),
+        ed.isNew || !state.detail.forgettingEnabled
+          ? null
+          : h("button", { class: "btn", onclick: forgetFile, title: t("forgottenHint") }, icon("archive"), t("forget")),
         h("button", { class: "btn", onclick: cancelEdit }, t("cancel")),
         saveBtn
       )
@@ -1643,7 +1670,15 @@
     if (ed.source) {
       line += " · " + t("sourceLine", { ids: ed.source });
     }
+    line += " · " + usageText(ed.lastUsed, ed.uses);
     return line;
+  }
+
+  function usageText(lastUsed, uses) {
+    if (!lastUsed) {
+      return t("neverUsed");
+    }
+    return t("usageLine", { time: relTime(lastUsed), n: uses || 0 });
   }
 
   function editorFromFile(data) {
@@ -1660,6 +1695,8 @@
       created: data.created || "",
       updated: data.updated || "",
       source: data.source || "",
+      lastUsed: data.lastUsed || 0,
+      uses: data.uses || 0,
       hasFrontmatter: Boolean(data.hasFrontmatter),
       dirty: false,
     };
@@ -1785,6 +1822,116 @@
       state.editor = null;
       toast(res.message || t("deleted"));
       await Promise.all([loadDetail(), loadOverview(true)]);
+    } catch (err) {
+      toast(err.message, "error");
+    }
+  }
+
+  async function forgetFile() {
+    const ed = state.editor;
+    const ok = await confirmDialog({
+      title: t("forgetTitle"),
+      message: t("forgetMessage", { file: ed.oldFile }),
+      confirm: t("forget"),
+    });
+    if (!ok) {
+      return;
+    }
+    try {
+      const res = await apiPost("file/forget", Object.assign(scopeParams(), { file: ed.oldFile }));
+      state.editor = null;
+      toast(res.message || t("forgotten"));
+      await Promise.all([loadDetail(), loadOverview(true)]);
+    } catch (err) {
+      toast(err.message, "error");
+    }
+  }
+
+  // ------------------------------------------------------------ 已遗忘标签页
+
+  function renderForgottenTab() {
+    const d = state.detail;
+    const items = (d.forgotten || []).slice().sort(function (a, b) {
+      return (b.forgottenAt || 0) - (a.forgottenAt || 0);
+    });
+    const panel = h(
+      "section",
+      { class: "panel" },
+      h(
+        "div",
+        { class: "panel-head" },
+        h("h3", null, t("forgottenTitle")),
+        h("span", { style: "color:var(--text-3);font-size:12.5px" }, d.forgettingEnabled ? t("forgottenHint") : t("forgottenOffHint"))
+      )
+    );
+    if (!items.length) {
+      panel.append(emptyState("archive", t("noForgottenTitle"), t("noForgottenHint", { days: d.forgetAfterDays || 0 })));
+      return panel;
+    }
+    items.forEach(function (f) {
+      panel.append(
+        h(
+          "div",
+          { class: "forgotten-item" },
+          h(
+            "div",
+            { class: "grow" },
+            h(
+              "div",
+              { class: "file-item-top" },
+              h("span", { class: "file-name" }, f.file),
+              typeTag(f.type),
+              h("span", { class: "file-age", title: fmtTime(f.forgottenAt) }, t("forgottenAt", { time: relTime(f.forgottenAt) }))
+            ),
+            h("div", { class: "file-desc" }, f.description || t("noDescription")),
+            h("div", { class: "session-sub" }, usageText(f.lastUsed, f.uses))
+          ),
+          h(
+            "div",
+            { class: "actions" },
+            h("button", { class: "btn small", onclick: function () { viewForgotten(f.file); } }, t("view")),
+            h("button", { class: "btn small primary", onclick: function () { restoreForgotten(f.file); } }, t("restore")),
+            h("button", { class: "btn small danger", onclick: function () { deleteForgotten(f.file); } }, t("delete"))
+          )
+        )
+      );
+    });
+    return panel;
+  }
+
+  async function viewForgotten(file) {
+    try {
+      const data = await apiGet("forgotten/file", Object.assign(scopeParams(), { file: file }));
+      openDialog({ title: file, body: h("pre", { class: "pre" }, data.content || ""), wide: true });
+    } catch (err) {
+      toast(err.message, "error");
+    }
+  }
+
+  async function restoreForgotten(file) {
+    try {
+      const res = await apiPost("forgotten/restore", Object.assign(scopeParams(), { file: file }));
+      toast(res.message || t("restored"));
+      await Promise.all([loadDetail(), loadOverview(true)]);
+    } catch (err) {
+      toast(err.message, "error");
+    }
+  }
+
+  async function deleteForgotten(file) {
+    const ok = await confirmDialog({
+      title: t("forgetDeleteTitle"),
+      message: t("forgetDeleteMessage", { file: file }),
+      confirm: t("delete"),
+      danger: true,
+    });
+    if (!ok) {
+      return;
+    }
+    try {
+      const res = await apiPost("forgotten/delete", Object.assign(scopeParams(), { file: file }));
+      toast(res.message || t("deleted"));
+      await loadDetail();
     } catch (err) {
       toast(err.message, "error");
     }

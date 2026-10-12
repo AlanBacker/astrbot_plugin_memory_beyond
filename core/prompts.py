@@ -173,6 +173,8 @@ _GLOBAL_OFF_NOTE = "\n全局记忆（global 作用域）已在插件配置中停
 
 _PEOPLE_OFF_NOTE = "\n人物记忆（people 作用域）已在插件配置中停用，不要读写，这样的请求会被拒绝。"
 
+_FORGET_NOTE = "\n\n遗忘：长期没被召回或读取的记忆会被插件自动移出索引与召回（指导类除外），文件并未删除。索引里没有不代表从没记过——拿不准时先 memory_search，结果里标注「已遗忘」的条目用 memory_read 读取即自动恢复；正在说话的人的记忆被遗忘后，他再出现时也会自动恢复。"
+
 _GUIDANCE_MIDDLE = """
 
 何时保存：用户告知长期有效的事实、纠正你的做法、确认某种做法可行、交代进行中的事项时，主动记录，不要等被要求——判断标准是这条信息在未来的对话里是否还有用。用户明确要你记住某件事时，立即按最合适的类型保存；要你忘掉某件事时，找到对应记忆删除，或从文件里删掉那部分。
@@ -191,9 +193,13 @@ _PRIVACY_GLOBAL = "；global 绝不存放关于具体用户或群的信息"
 _PRIVACY_PEOPLE = "；people 只存本人亲口说的、换个群也成立的信息，不存他在某个群里的言行细节，也不替别人代写"
 
 
-def memory_guidance(include_global: bool = True, include_people: bool = False) -> str:
-    """记忆规范文本，按全局记忆、人物记忆两个开关组合生成，每种组合逐字稳定
-    （不破坏提示词缓存）。
+def memory_guidance(
+    include_global: bool = True,
+    include_people: bool = False,
+    include_forgetting: bool = False,
+) -> str:
+    """记忆规范文本，按全局记忆、人物记忆、遗忘三个开关组合生成，每种组合
+    逐字稳定（不破坏提示词缓存）。
 
     停用的作用域不描述，只明确告知不要读写——工具说明是静态的仍会列出
     它们，不在这里讲清楚，模型就会反复尝试一个必然被拒绝的作用域。
@@ -212,6 +218,8 @@ def memory_guidance(include_global: bool = True, include_people: bool = False) -
             scopes += _GLOBAL_OFF_NOTE
         elif not include_people:
             scopes += _PEOPLE_OFF_NOTE
+    if include_forgetting:
+        scopes += _FORGET_NOTE
     privacy = _PRIVACY_BASE
     if include_global:
         privacy += _PRIVACY_GLOBAL

@@ -22,7 +22,7 @@ def test_build_prompt_includes_files_and_skips_over_budget():
         now=NOW,
     )
     assert "「周末开黑群」" in prompt
-    assert "=== a.md（2 天前写入）===\n内容A" in prompt
+    assert "=== a.md（2 天前写入，从未被用到）===\n内容A" in prompt
     assert skipped == ["b.md"]
 
 
@@ -134,3 +134,11 @@ def test_ordered_writes_before_deletes():
         consolidate.Operation(op="delete", file="c.md"),
     ]
     assert [op.file for op in consolidate.ordered(ops)] == ["a.md", "b.md", "c.md"]
+
+
+def test_build_prompt_marks_usage():
+    used = header("u.md", NOW - 86400)
+    used.last_used = NOW - 3 * 86400
+    prompt, _ = consolidate.build_prompt("x", [(used, "内容")], now=NOW)
+    assert "=== u.md（昨天写入，最近用到于3 天前）===" in prompt
+    assert "最近被用到的时间" in prompt

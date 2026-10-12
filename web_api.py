@@ -99,6 +99,9 @@ def _header_dict(header: memstore.MemoryHeader) -> dict:
         "source": header.source,
         "size": header.size,
         "links": header.links,
+        "lastUsed": header.last_used,
+        "uses": header.uses,
+        "forgottenAt": header.forgotten_at,
     }
 
 
@@ -171,8 +174,12 @@ class MemoryDashboard:
             ("session/state", "GET", self.session_state, "记忆管理：压缩状态"),
             ("archives", "GET", self.archives, "记忆管理：归档列表"),
             ("archive", "GET", self.archive_detail, "记忆管理：归档内容"),
+            ("forgotten/file", "GET", self.forgotten_file, "记忆管理：读取已遗忘的文件"),
             ("file/save", "POST", self.file_save, "记忆管理：保存记忆文件"),
             ("file/delete", "POST", self.file_delete, "记忆管理：删除记忆文件"),
+            ("file/forget", "POST", self.file_forget, "记忆管理：遗忘记忆文件"),
+            ("forgotten/restore", "POST", self.forgotten_restore, "记忆管理：恢复已遗忘的文件"),
+            ("forgotten/delete", "POST", self.forgotten_delete, "记忆管理：彻底删除已遗忘的文件"),
             ("index/save", "POST", self.index_save, "记忆管理：保存索引"),
             ("index/rebuild", "POST", self.index_rebuild, "记忆管理：重建索引"),
             ("session/reset", "POST", self.session_reset, "记忆管理：重置压缩状态"),
@@ -353,6 +360,7 @@ class MemoryDashboard:
             )
             return {
                 "files": [_header_dict(h) for h in headers],
+                "forgotten": [_header_dict(h) for h in store.forgotten_headers()],
                 "index": {
                     "exists": report.exists,
                     "content": index_text,
@@ -369,6 +377,8 @@ class MemoryDashboard:
         data = await asyncio.to_thread(collect)
         data["scope"] = scope
         data["key"] = key
+        data["forgettingEnabled"] = self.plugin._forgetting_on()
+        data["forgetAfterDays"] = self.plugin._forget_after_days()
         if scope == SCOPE_SESSION:
             data["session"] = _record_dict(key, self.plugin._registry.get(key))
             data["archiveCount"] = await asyncio.to_thread(
@@ -388,11 +398,14 @@ class MemoryDashboard:
         if content is None:
             raise ApiError(f"文件不存在：{name}")
         doc = memstore.parse_memory(content)
+        used = await asyncio.to_thread(store.usage_of, name)
         return _ok(
             {
                 "file": name,
                 "content": content,
                 "mtime": store.mtime(name) or 0.0,
+                "lastUsed": used.last_used,
+                "uses": used.uses,
                 "name": doc.name,
                 "description": doc.description,
                 "type": doc.type,
@@ -512,6 +525,55 @@ class MemoryDashboard:
         self._changed(key)
         return _ok({"file": name}, report.message)
 
+    # ------------------------------------------------------------ 遗忘
+
+    async def forgotten_file(self) -> dict:
+        _, _, store = self._scope_from_query()
+        name = self._file_name(_query("file"))
+        content = await store.read_forgotten(name)
+        if content is None:
+            raise ApiError(f"没有已遗忘的 {name}")
+        used = await asyncio.to_thread(store.usage_of, name)
+        return _ok(
+            {
+                "file": name,
+                "content": content,
+                "lastUsed": used.last_used,
+                "uses": used.uses,
+                "forgottenAt": used.forgotten_at,
+            }
+        )
+
+    async def file_forget(self) -> dict:
+        """管理员手动把一个在册文件移入已遗忘。"""
+        body = await _body()
+        _, key, store = self._scope_from_body(body)
+        name = self._file_name(body.get("file"))
+        report = await store.forget(name)
+        if not report.ok:
+            raise ApiError(report.message)
+        self._changed(key)
+        return _ok({"file": name}, report.message)
+
+    async def forgotten_restore(self) -> dict:
+        body = await _body()
+        _, key, store = self._scope_from_body(body)
+        name = self._file_name(body.get("file"))
+        report = await store.restore(name)
+        if not report.ok:
+            raise ApiError(report.message)
+        self._changed(key)
+        return _ok({"file": name}, report.message)
+
+    async def forgotten_delete(self) -> dict:
+        body = await _body()
+        _, _, store = self._scope_from_body(body)
+        name = self._file_name(body.get("file"))
+        report = await store.delete_forgotten(name)
+        if not report.ok:
+            raise ApiError(report.message)
+        return _ok({"file": name}, report.message)
+
     async def index_save(self) -> dict:
         body = await _body()
         _, key, store = self._scope_from_body(body)
@@ -608,7 +670,7 @@ class MemoryDashboard:
             prompt, skipped = consolidate.build_prompt(
                 self._scope_label(scope, key), files
             )
-            text, attempts = await self.plugin.call_summarizer(prompt)
+            text, attempts = await self.plugin.call_consolidator(prompt)
             if not text:
                 raise ApiError(
                     "整理模型调用失败："

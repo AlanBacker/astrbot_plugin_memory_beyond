@@ -417,3 +417,13 @@ def test_parse_memories_reads_source_ids():
     assert drafts[0].source == "111, 222" and drafts[1].source == ""
     assert "metadata:\n  type: user\n  source: 111, 222\n---" in render_memory_file(drafts[0])
     assert "source" not in render_memory_file(drafts[1])
+
+
+def test_memory_guidance_forgetting_note():
+    plain = prompts.memory_guidance(True, True)
+    with_forget = prompts.memory_guidance(True, True, True)
+    assert "遗忘：" not in plain and "遗忘：" in with_forget
+    assert with_forget.replace(prompts._FORGET_NOTE, "", 1) == plain
+    assert prompts.memory_guidance(False, False, True).replace(
+        prompts._FORGET_NOTE, "", 1
+    ) == prompts.memory_guidance(False, False)

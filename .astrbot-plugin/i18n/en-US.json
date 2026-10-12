@@ -56,7 +56,11 @@
     },
     "summary_provider_id": {
       "description": "Summary model provider",
-      "hint": "The provider used for compression summaries, background memory extraction, tidying memories on the memory page and \"Model picks\" recall. A cheap, fast model is a good choice. Leave empty to use the current chat's provider. If the chosen provider fails after all retries, the current chat's provider is used instead."
+      "hint": "The provider used for compression summaries, background memory extraction and \"Model picks\" recall. A cheap, fast model is a good choice. Leave empty to use the current chat's provider. If the chosen provider fails after all retries, the current chat's provider is used instead. Tidying memories on the memory page uses it too unless the next option names a different provider."
+    },
+    "consolidate_provider_id": {
+      "description": "Memory tidying model provider",
+      "hint": "The provider used by \"Tidy memories\" and \"Tidy all memories\" on the memory page. Tidying reads every memory in a scope and proposes merges and rewrites, which asks more of the model than a summary does, so you can pick a stronger model here. Leave empty to use the summary provider; if both are empty, the default chat provider is used. If the chosen provider fails after all retries, the summary provider and then the default chat provider are tried in turn."
     },
     "summary_retry_count": {
       "description": "Summary retries",
@@ -81,6 +85,14 @@
     "auto_extract_interval": {
       "description": "Background memory extraction interval (turns)",
       "hint": "Every this many turns, recent messages are handed to the summary model in the background to note down anything worth remembering long term (current chat only; related memories are updated instead of duplicated). Skipped if the bot already wrote a memory itself during that stretch. Runs in the background and does not slow replies. Default 10; 0 turns it off."
+    },
+    "enable_forgetting": {
+      "description": "Enable memory forgetting",
+      "hint": "When on, memories that have not been recalled or read for a long time drop out of the index and recall so the bot stops carrying them, but the files are kept: they come back automatically when that person shows up again or the bot reads the memory itself, and the memory page's \"Forgotten\" tab lets you restore or delete them for good. Guidance (feedback) memories are never forgotten. Off by default; nothing changes while off."
+    },
+    "forget_after_days": {
+      "description": "Forget after this many unused days",
+      "hint": "A memory is moved to Forgotten after it has not been recalled or read for this many days (never-used memories count from their last edit). Only applies while \"Enable memory forgetting\" is on. Default 90."
     },
     "tool_result_idle_minutes": {
       "description": "Clear old tool results after idle (minutes)",
@@ -245,6 +257,24 @@
       "noArchivesTitle": "No archives yet",
       "noArchivesHint": "When context is compressed, the messages replaced by the summary are kept here so you can check that nothing important was lost.",
       "archiveMeta": "{count} messages · summary {chars} chars",
+      "tabForgotten": "Forgotten",
+      "forgottenTitle": "Forgotten memories",
+      "forgottenHint": "Memories that have not been recalled or read for a long time are moved here: out of the index and recall, files kept. They come back automatically when that person shows up again or the bot reads them itself.",
+      "forgottenOffHint": "Memory forgetting is currently off. These files were forgotten earlier; nothing more will be forgotten or restored automatically, but you can restore or delete them here.",
+      "noForgottenTitle": "No forgotten memories",
+      "noForgottenHint": "Memories not recalled or read for more than {days} days (except guidance) are moved here automatically.",
+      "forgottenAt": "forgotten {time}",
+      "usageLine": "last used {time} · {n} times",
+      "neverUsed": "never recalled or read",
+      "view": "View",
+      "restore": "Restore",
+      "restored": "Restored",
+      "forget": "Forget",
+      "forgetTitle": "Forget memory",
+      "forgetMessage": "Move {file} to Forgotten: it leaves the index and recall, the file is kept, and you can restore it any time.",
+      "forgotten": "Forgotten",
+      "forgetDeleteTitle": "Delete permanently",
+      "forgetDeleteMessage": "Permanently delete the forgotten file {file}? This cannot be undone.",
       "backToArchives": "Back to archives",
       "archiveSummary": "Summary from this compression",
       "archiveMessages": "Messages that were summarized ({n})",

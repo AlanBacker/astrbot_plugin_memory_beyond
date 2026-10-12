@@ -16,17 +16,24 @@
 模型改索引行的唯一途径是改文件本身——单一事实来源，杜绝往索引里写正文、
 漏登记、格式跑偏这一整类错误。索引接近注入上限时在写入回执里提醒合并
 记忆文件。工具读文件读到的始终是完整文件（截断只发生在注入通道）。
+
+使用统计与遗忘：每个作用域目录下有一份 .usage.json，记每个文件最近一次
+被召回或读取的时间与次数。开启遗忘后，长期没用到的文件移进 forgotten/
+子目录——不进索引、不参与召回、工具看不见，但文件还在；那个人再出现、
+或模型主动读它时自动恢复，管理页也能恢复或彻底删除。
 """
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import os
 import re
 import shutil
 import threading
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -53,6 +60,12 @@ STAMP_KEYS = ("created", "updated", "source")
 STAMP_FORMAT = "%Y-%m-%d %H:%M"
 # source 最多保留最近几个 ID，避免被反复改写的文件越积越长
 MAX_SOURCES = 5
+
+# 使用统计旁存文件（不是记忆，不进索引）与已遗忘文件的子目录
+USAGE_FILENAME = ".usage.json"
+FORGOTTEN_DIRNAME = "forgotten"
+# 指导类记忆是行为约束，长期不被提起不代表失效，不参与遗忘
+FORGET_EXEMPT_TYPES = ("feedback",)
 
 _SAFE_KEY_RE = re.compile(r"[^A-Za-z0-9._-]")
 _SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,120}$")
@@ -387,10 +400,55 @@ class MemoryHeader:
     updated: float = 0.0
     created: float = 0.0
     source: str = ""
+    # 使用统计（来自 .usage.json）：最近一次被召回或读取的时间、累计次数
+    last_used: float = 0.0
+    uses: int = 0
+    # 已遗忘文件的遗忘时间；在册文件为 0
+    forgotten_at: float = 0.0
 
     def __post_init__(self) -> None:
         if not self.updated:
             self.updated = self.mtime
+
+    def idle_since(self) -> float:
+        """遗忘判定的起点：用过按最近使用，没用过按最近修改。"""
+        return self.last_used or self.updated
+
+
+@dataclass
+class Usage:
+    """一个文件的使用统计。"""
+
+    last_used: float = 0.0
+    uses: int = 0
+    forgotten_at: float = 0.0
+
+    @classmethod
+    def from_raw(cls, raw: object) -> "Usage":
+        if not isinstance(raw, dict):
+            return cls()
+        return cls(
+            last_used=_as_float(raw.get("last_used")),
+            uses=int(_as_float(raw.get("uses"))),
+            forgotten_at=_as_float(raw.get("forgotten_at")),
+        )
+
+    def to_raw(self) -> dict:
+        raw: dict = {}
+        if self.last_used:
+            raw["last_used"] = round(self.last_used, 3)
+        if self.uses:
+            raw["uses"] = self.uses
+        if self.forgotten_at:
+            raw["forgotten_at"] = round(self.forgotten_at, 3)
+        return raw
+
+
+def _as_float(value: object) -> float:
+    try:
+        return float(value or 0)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0.0
 
 
 @dataclass
@@ -439,6 +497,8 @@ class ScopeStore:
         self._headers: dict[str, tuple[tuple[int, int], MemoryHeader]] = {}
         # headers() 在工作线程里跑，召回与 WebUI 可能并发调用
         self._headers_lock = threading.Lock()
+        # .usage.json 的读改写互斥（召回记用与管理页可能并发）
+        self._usage_lock = threading.Lock()
 
     # ------------------------------------------------------------ 路径约束
 
@@ -519,6 +579,7 @@ class ScopeStore:
             return []
         result: list[MemoryHeader] = []
         alive: set[str] = set()
+        usage = self._load_usage()
         with os.scandir(self.root) as entries:
             for entry in entries:
                 name = entry.name
@@ -538,32 +599,43 @@ class ScopeStore:
                 if cached is not None and cached[0] == stamp:
                     result.append(cached[1])
                     continue
-                try:
-                    with open(entry.path, encoding="utf-8", errors="replace") as fh:
-                        content = fh.read(MAX_FILE_BYTES)
-                except OSError:
+                header = self._read_header(entry.path, name, st)
+                if header is None:
                     continue
-                doc = parse_memory(content)
-                description = doc.description or parse_description(content)[0]
-                header = MemoryHeader(
-                    file=name,
-                    name=doc.name or name[: -len(MEMORY_FILE_SUFFIX)],
-                    description=description,
-                    type=doc.type,
-                    mtime=st.st_mtime,
-                    size=st.st_size,
-                    text=content[:HEADER_TEXT_CHARS].lower(),
-                    links=extract_links(doc.body),
-                    updated=parse_stamp(doc.updated) or st.st_mtime,
-                    created=parse_stamp(doc.created) or 0.0,
-                    source=doc.source,
-                )
+                used = usage.get(name, Usage())
+                header.last_used = used.last_used
+                header.uses = used.uses
                 self._headers[name] = (stamp, header)
                 result.append(header)
         for gone in set(self._headers) - alive:
             del self._headers[gone]
         result.sort(key=lambda h: h.file)
         return result
+
+    @staticmethod
+    def _read_header(
+        path: str | Path, name: str, st: os.stat_result
+    ) -> MemoryHeader | None:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                content = fh.read(MAX_FILE_BYTES)
+        except OSError:
+            return None
+        doc = parse_memory(content)
+        description = doc.description or parse_description(content)[0]
+        return MemoryHeader(
+            file=name,
+            name=doc.name or name[: -len(MEMORY_FILE_SUFFIX)],
+            description=description,
+            type=doc.type,
+            mtime=st.st_mtime,
+            size=st.st_size,
+            text=content[:HEADER_TEXT_CHARS].lower(),
+            links=extract_links(doc.body),
+            updated=parse_stamp(doc.updated) or st.st_mtime,
+            created=parse_stamp(doc.created) or 0.0,
+            source=doc.source,
+        )
 
     # ------------------------------------------------------------ 写 / 删
 
@@ -586,7 +658,13 @@ class ScopeStore:
                 "要删除索引行，删除对应文件（delete=true）即可，索引会自动同步。",
             )
         async with self._lock:
+            # 同名文件若已被遗忘，把它当作上一版：created 戳得以延续，
+            # 新内容落盘后那份遗忘副本随之作废
             previous = await asyncio.to_thread(self._read_if_exists, path)
+            if previous is None:
+                previous = await asyncio.to_thread(
+                    self._read_if_exists, self._forgotten_path(name)
+                )
             return await self._commit(
                 name, path, content, f"已写入 {name}", source, previous
             )
@@ -677,6 +755,7 @@ class ScopeStore:
         description, from_frontmatter = parse_description(content)
         await asyncio.to_thread(self._write_atomic, path, content)
         self._drop_header(name)
+        await asyncio.to_thread(self._discard_forgotten, name)
         lines, size = await asyncio.to_thread(
             self._sync_index_line, name, description
         )
@@ -707,10 +786,12 @@ class ScopeStore:
             await asyncio.to_thread(path.unlink)
             self._drop_header(name)
             await asyncio.to_thread(self._remove_index_line, name)
+            await asyncio.to_thread(self._forget_usage, name)
         return WriteReport(True, f"已删除 {name}，对应索引行已同步移除")
 
     async def purge(self) -> int:
-        """删除整个作用域目录（全部记忆文件与索引），返回删除的记忆文件数。"""
+        """删除整个作用域目录（全部记忆文件、已遗忘文件、使用统计与索引），
+        返回删除的在册记忆文件数。"""
         async with self._lock:
             count = len(self.list_files())
             if self.root.is_dir():
@@ -718,6 +799,255 @@ class ScopeStore:
             with self._headers_lock:
                 self._headers.clear()
         return count
+
+    # ------------------------------------------------------------ 使用统计
+
+    def _usage_path(self) -> Path:
+        return self.root / USAGE_FILENAME
+
+    def _load_usage(self) -> dict[str, Usage]:
+        path = self._usage_path()
+        if not path.is_file():
+            return {}
+        try:
+            data = json.loads(path.read_text("utf-8"))
+        except (OSError, ValueError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {
+            str(name): Usage.from_raw(raw)
+            for name, raw in data.items()
+            if self.is_valid_name(str(name))
+        }
+
+    def _save_usage(self, data: dict[str, Usage]) -> None:
+        raw = {name: u.to_raw() for name, u in data.items() if u.to_raw()}
+        path = self._usage_path()
+        if not raw:
+            if path.is_file():
+                path.unlink()
+            return
+        self._write_atomic(
+            path, json.dumps(raw, ensure_ascii=False, separators=(",", ":"))
+        )
+
+    def usage(self) -> dict[str, Usage]:
+        """全部文件的使用统计（同步方法）。"""
+        with self._usage_lock:
+            return self._load_usage()
+
+    def usage_of(self, name: str) -> Usage:
+        return self.usage().get((name or "").strip(), Usage())
+
+    def note_used(self, names: Iterable[str], now: float | None = None) -> None:
+        """记下这些文件刚被召回或读取（同步方法，放进线程执行）。"""
+        wanted = [
+            n for n in dict.fromkeys((n or "").strip() for n in names)
+            if self.is_valid_name(n) and n != INDEX_FILENAME
+        ]
+        if not wanted:
+            return
+        now = time.time() if now is None else now
+        with self._usage_lock:
+            data = self._load_usage()
+            for name in wanted:
+                used = data.get(name, Usage())
+                used.last_used = now
+                used.uses += 1
+                data[name] = used
+            self._save_usage(data)
+        # 头缓存按 (mtime, size) 失效，使用统计变了得原地改
+        with self._headers_lock:
+            for name in wanted:
+                cached = self._headers.get(name)
+                if cached is not None:
+                    cached[1].last_used = now
+                    cached[1].uses += 1
+
+    def _forget_usage(self, name: str) -> None:
+        """文件彻底删除后，它的使用统计也不留。"""
+        with self._usage_lock:
+            data = self._load_usage()
+            if data.pop(name, None) is not None:
+                self._save_usage(data)
+
+    # ------------------------------------------------------------ 遗忘
+
+    def _forgotten_path(self, name: str) -> Path:
+        return self.root / FORGOTTEN_DIRNAME / name
+
+    def forgotten_files(self) -> list[str]:
+        """已遗忘的文件名（同步方法）。"""
+        folder = self.root / FORGOTTEN_DIRNAME
+        if not folder.is_dir():
+            return []
+        return sorted(
+            p.name for p in folder.iterdir()
+            if p.is_file() and self.is_valid_name(p.name) and p.name != INDEX_FILENAME
+        )
+
+    def has_forgotten(self, name: str) -> bool:
+        name = (name or "").strip()
+        return self.is_valid_name(name) and self._forgotten_path(name).is_file()
+
+    async def read_forgotten(self, name: str) -> str | None:
+        name = (name or "").strip()
+        if not self.is_valid_name(name):
+            return None
+        path = self._forgotten_path(name)
+        if not path.is_file():
+            return None
+        return await asyncio.to_thread(path.read_text, "utf-8")
+
+    def forgotten_headers(self) -> list[MemoryHeader]:
+        """已遗忘文件的头信息（同步方法，不缓存：这份清单只给管理页与搜索）。"""
+        usage = self.usage()
+        result: list[MemoryHeader] = []
+        for name in self.forgotten_files():
+            path = self._forgotten_path(name)
+            try:
+                st = path.stat()
+            except OSError:
+                continue
+            header = self._read_header(path, name, st)
+            if header is None:
+                continue
+            used = usage.get(name, Usage())
+            header.last_used = used.last_used
+            header.uses = used.uses
+            header.forgotten_at = used.forgotten_at or st.st_mtime
+            result.append(header)
+        return result
+
+    async def forget_stale(
+        self, max_idle: float, now: float | None = None
+    ) -> list[str]:
+        """把长期没用到的在册记忆移进 forgotten/，返回被遗忘的文件名。
+
+        判定起点是最近一次被召回或读取的时间；从没用过的按最近修改时间。
+        指导类（feedback）不遗忘。被遗忘的文件离开索引与召回，但不删除。
+        """
+        now = time.time() if now is None else now
+        async with self._lock:
+            return await asyncio.to_thread(self._forget_stale_sync, max_idle, now)
+
+    def _forget_stale_sync(self, max_idle: float, now: float) -> list[str]:
+        forgotten: list[str] = []
+        for header in self.headers():
+            if header.type in FORGET_EXEMPT_TYPES:
+                continue
+            if now - header.idle_since() < max_idle:
+                continue
+            if self._move_to_forgotten(header.file, now):
+                forgotten.append(header.file)
+        return forgotten
+
+    async def forget(self, name: str, now: float | None = None) -> WriteReport:
+        """管理员手动遗忘一个在册文件。"""
+        name = (name or "").strip().lstrip("/")
+        path = self._resolve(name)
+        if path is None or name.lower() == INDEX_FILENAME.lower():
+            return WriteReport(False, f"文件名不合法：{self.path_rules()}")
+        now = time.time() if now is None else now
+        async with self._lock:
+            if not path.is_file():
+                return WriteReport(False, f"文件不存在：{name}")
+            moved = await asyncio.to_thread(self._move_to_forgotten, name, now)
+        if not moved:
+            return WriteReport(False, f"遗忘 {name} 失败")
+        return WriteReport(True, f"已遗忘 {name}，索引行已移除；需要时可恢复")
+
+    def _move_to_forgotten(self, name: str, now: float) -> bool:
+        src = self.root / name
+        dst = self._forgotten_path(name)
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            src.replace(dst)
+        except OSError:
+            return False
+        self._drop_header(name)
+        self._remove_index_line(name)
+        with self._usage_lock:
+            data = self._load_usage()
+            used = data.get(name, Usage())
+            used.forgotten_at = now
+            data[name] = used
+            self._save_usage(data)
+        return True
+
+    async def restore(self, name: str, now: float | None = None) -> WriteReport:
+        """把已遗忘的文件恢复在册：回到索引与召回，并记为刚被用到。"""
+        name = (name or "").strip().lstrip("/")
+        if not self.is_valid_name(name) or name.lower() == INDEX_FILENAME.lower():
+            return WriteReport(False, f"文件名不合法：{self.path_rules()}")
+        now = time.time() if now is None else now
+        async with self._lock:
+            return await asyncio.to_thread(self._restore_sync, name, now)
+
+    def _restore_sync(self, name: str, now: float) -> WriteReport:
+        src = self._forgotten_path(name)
+        dst = self.root / name
+        if not src.is_file():
+            return WriteReport(False, f"没有已遗忘的 {name}")
+        if dst.is_file():
+            return WriteReport(False, f"同名记忆 {name} 仍在册，无法恢复；请先处理在册的那份")
+        try:
+            content = src.read_text("utf-8")
+            src.replace(dst)
+        except OSError as exc:
+            return WriteReport(False, f"恢复 {name} 失败：{exc}")
+        self._drop_header(name)
+        description, _ = parse_description(content)
+        self._sync_index_line(name, description)
+        with self._usage_lock:
+            data = self._load_usage()
+            used = data.get(name, Usage())
+            used.forgotten_at = 0.0
+            used.last_used = now
+            used.uses += 1
+            data[name] = used
+            self._save_usage(data)
+        self._prune_forgotten_dir()
+        return WriteReport(True, f"已恢复 {name}，索引行已同步")
+
+    async def delete_forgotten(self, name: str) -> WriteReport:
+        """彻底删除一个已遗忘的文件。"""
+        name = (name or "").strip().lstrip("/")
+        if not self.is_valid_name(name):
+            return WriteReport(False, f"文件名不合法：{self.path_rules()}")
+        async with self._lock:
+            path = self._forgotten_path(name)
+            if not path.is_file():
+                return WriteReport(False, f"没有已遗忘的 {name}")
+            await asyncio.to_thread(path.unlink)
+            await asyncio.to_thread(self._forget_usage, name)
+            await asyncio.to_thread(self._prune_forgotten_dir)
+        return WriteReport(True, f"已彻底删除 {name}")
+
+    def _discard_forgotten(self, name: str) -> None:
+        """在册文件刚被重写：同名的遗忘副本作废，使用统计里的遗忘标记清掉。"""
+        path = self._forgotten_path(name)
+        if path.is_file():
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            self._prune_forgotten_dir()
+        with self._usage_lock:
+            data = self._load_usage()
+            used = data.get(name)
+            if used is not None and used.forgotten_at:
+                used.forgotten_at = 0.0
+                self._save_usage(data)
+
+    def _prune_forgotten_dir(self) -> None:
+        folder = self.root / FORGOTTEN_DIRNAME
+        try:
+            if folder.is_dir() and not any(folder.iterdir()):
+                folder.rmdir()
+        except OSError:
+            pass
 
     def _drop_header(self, name: str) -> None:
         with self._headers_lock:
@@ -886,14 +1216,21 @@ class ScopeStore:
         这是索引截断或索引行写得不好时的兜底通道：不依赖"模型知道这条
         记忆存在"，只要正文里有词就能找到。
         """
+        return await self._search_in(query, self.list_files(), self.read)
+
+    async def search_forgotten(self, query: str) -> list[str]:
+        """同样的搜索，只搜已遗忘的文件。"""
+        return await self._search_in(query, self.forgotten_files(), self.read_forgotten)
+
+    async def _search_in(self, query: str, names: list[str], reader) -> list[str]:
         terms = [t.lower() for t in query.split() if t.strip()]
         if not terms:
             return []
         results: list[str] = []
-        for name in self.list_files():
+        for name in names:
             if len(results) >= MAX_SEARCH_RESULTS:
                 break
-            content = await self.read(name)
+            content = await reader(name)
             if content is None:
                 continue
             lowered = content.lower()
