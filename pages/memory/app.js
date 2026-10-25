@@ -237,6 +237,105 @@
     daysAgo: "{n} 天前",
     seconds: "{n} 秒",
     minutes: "{n} 分钟",
+    tidyAskTitle: "要不要定期自动整理记忆？",
+    tidyAskHint: "开启后，插件会隔一段时间（默认 24 小时）看一眼：上次整理之后新攒了至少 {n} 条记忆，才让模型在后台复盘一遍，合并重复的、删掉过时的。模型觉得不用改就什么都不动。只在有人聊天时检查。",
+    tidyModeConfirm: "整理前问我",
+    tidyModeConfirmHint: "有修改方案时先留着，你在这里确认后才写入",
+    tidyModeAuto: "直接整理",
+    tidyModeAutoHint: "有方案就直接写入，之后可以在「整理记录」里撤销",
+    tidyModeOff: "暂不开启",
+    tidyModeOffHint: "以后可以在这里或插件配置里打开",
+    tidyModeOffLabel: "关闭",
+    recommended: "推荐",
+    tidyTitle: "定期整理",
+    tidyStatusOff: "未开启：记忆只在你点「整理记忆」时整理。",
+    tidyStatusOn: "至少隔 {hours} 小时，且新增至少 {n} 条记忆才整理",
+    change: "更改",
+    tidyHours: "最短间隔（小时）",
+    tidyHoursHint: "1 – 720",
+    tidyPendingTitle: "等你确认的整理方案",
+    tidyPendingNotice: "{time}，定期整理给出了 {n} 项修改方案，确认后才会写入。",
+    tidyPendingBadge: "有待确认的整理方案",
+    viewPlan: "查看方案",
+    dismiss: "放弃",
+    dismissTitle: "放弃这份方案？",
+    dismissMessage: "方案会被丢弃，记忆保持不变；下次定期整理时会重新复盘。",
+    dismissed: "已放弃",
+    planTitle: "定期整理的方案",
+    tidyHistory: "整理记录",
+    historyLast: "上次整理：{time}，{result}",
+    outcome_nothing: "模型认为不需要整理",
+    outcome_pending: "方案等你确认",
+    outcome_applied: "应用了修改",
+    outcome_failed: "失败（{message}）",
+    historyEmptyTitle: "还没有整理记录",
+    historyEmptyHint: "整理应用修改后会在这里留下记录，最近 {n} 次可以撤销。",
+    trigger_manual: "手动整理",
+    trigger_auto: "定期整理",
+    trigger_confirmed: "定期整理 · 已确认",
+    runOps: "{n} 项修改",
+    undo: "撤销",
+    undone: "已撤销",
+    undoTitle: "撤销这次整理？",
+    undoMessage: "被删除的记忆会写回，被改写的恢复原文，新建的删掉。整理之后又改过的文件不会动。",
+    undoDone: "已撤销 {ok} / {total} 项",
+    migrate: "迁移与备份",
+    migrateHint: "导出记忆做备份、从备份恢复，或在机器人换了平台 ID 后把记忆搬过去。",
+    open: "打开",
+    tabExport: "导出备份",
+    tabImport: "导入备份",
+    tabPlatform: "平台改名",
+    exportHint: "把记忆原文连同写入时间、使用次数存成一个文件。压缩状态和归档不在备份里。",
+    exportScopes: "要导出的地方",
+    includeForgotten: "包含已遗忘的记忆",
+    exportButton: "导出",
+    exportNone: "还没有可导出的记忆",
+    exported: "已导出 {n} 条记忆",
+    importHint: "选择之前导出的备份文件。会先列出每处会新增、覆盖多少条，勾选后才写入。",
+    chooseFile: "选择备份文件",
+    badBackup: "读不了这个文件：{message}",
+    policy: "遇到同名记忆",
+    policy_newer: "保留较新的",
+    policy_skip: "保留现有的",
+    policy_overwrite: "用迁入的覆盖",
+    importButton: "导入所选",
+    imported: "导入完成：写入 {n} 条记忆",
+    importNothing: "没有写入：所选记忆和现有的一样，或按同名处理方式保留了现有的。",
+    cnt_added: "新增 {n}",
+    cnt_replaced: "覆盖 {n}",
+    cnt_same: "相同 {n}",
+    cnt_kept: "保留现有 {n}",
+    cnt_invalid: "不合法 {n}",
+    cntNone: "没有要写入的",
+    forgottenIncluded: "含已遗忘 {n}",
+    issuesCount: "{n} 条不会写入",
+    platformHint: "在 AstrBot 里删掉重建了机器人、或改了它的 ID 之后，会话标识的第一段会变，原来的记忆就对不上了。这里把旧 ID 下所有会话的记忆、备注和归档一起搬到新 ID 下。",
+    platformFrom: "旧平台 ID",
+    platformTo: "新平台 ID",
+    platformToHint: "可以从当前启用的机器人里选",
+    platformSessions: "{n} 个会话",
+    platformNone: "还没有可迁移的平台",
+    modeLabel: "方式",
+    modeMove: "移动",
+    modeCopy: "复制",
+    moveHint: "移动时只删掉成功写到目标的记忆；因同名冲突没写过去的仍留在原处。",
+    includePeople: "连人物记忆一起迁移",
+    preview: "预览",
+    runMigrate: "开始迁移",
+    migratePreview: "将迁移 {n} 处：",
+    migrateSkipped: "{n} 个会话缺少完整的会话标识，换算不出新会话，会留在原处：",
+    migrated: "迁移完成：写入 {n} 条记忆",
+    migrateNothing: "没有要迁移的记忆",
+    migrateTo: "迁移到…",
+    migrateScopeHint: "把这里的记忆复制或移动到另一处，写入时间和使用次数原样保留。",
+    targetLabel: "目标",
+    targetNewSession: "新的会话（填写会话标识）",
+    targetNewPeople: "其他平台的人物记忆（填写平台 ID）",
+    targetUmo: "会话标识",
+    targetUmoHint: "平台ID:GroupMessage:群号，或 平台ID:FriendMessage:用户ID",
+    targetPlatform: "平台 ID",
+    filesLabel: "要迁移的记忆",
+    selectedFiles: "已选 {n} / {total} 条",
   };
 
   const ICONS = {
@@ -260,6 +359,9 @@
     file: '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/>',
     inbox: '<path d="M4 13l2.5-7h11l2.5 7v5a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z"/><path d="M4 13h5l1 2h4l1-2h5"/>',
     rotate: '<path d="M4 12a8 8 0 1 0 2.4-5.7L4 8.6"/><path d="M4 4v4.6h4.6"/>',
+    transfer: '<path d="M4 8h13l-3.5-3.5M20 16H7l3.5 3.5"/>',
+    history: '<path d="M4 12a8 8 0 1 0 2.4-5.7L4 8.6"/><path d="M4 4v4.6h4.6M12 8v4l3 2"/>',
+    clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
   };
 
   // ------------------------------------------------------------ 基础工具
@@ -893,6 +995,7 @@
             "div",
             { class: "brand-actions" },
             h("button", { class: "btn ghost icon-only", title: t("consolidateAll"), onclick: consolidateAll }, icon("sparkles")),
+            h("button", { class: "btn ghost icon-only", title: t("migrate"), onclick: function () { openMigration("export"); } }, icon("transfer")),
             h("button", { class: "btn ghost icon-only", title: t("refresh"), onclick: refreshAll }, icon("refresh"))
           )
         ),
@@ -997,6 +1100,7 @@
           h("div", { class: "session-name" }, t("globalTitle")),
           h("div", { class: "session-sub" }, g.enabled ? t("globalSub") : t("disabled"))
         ),
+        pendingDot(g.tidyPending),
         h("span", { class: "count" }, g.fileCount)
       )
     );
@@ -1025,6 +1129,7 @@
               h("div", { class: "session-name" }, p.platform),
               h("div", { class: "session-sub" }, people.enabled ? t("peopleSub") : t("disabled"))
             ),
+            pendingDot(p.tidyPending),
             h("span", { class: "count" }, p.fileCount)
           )
         );
@@ -1054,6 +1159,7 @@
             h("div", { class: "session-name" }, sessionTitle(s)),
             h("div", { class: "session-sub" }, sessionSub(s))
           ),
+          pendingDot(s.tidyPending),
           h("span", { class: "count" }, s.fileCount)
         )
       );
@@ -1112,6 +1218,7 @@
       if (!ov.memoryEnabled) {
         box.append(notice("warn", t("memoryOffNotice")));
       }
+      append(box, [renderTidyCard(ov), renderPendingPanel(ov)]);
       box.append(
         h(
           "div",
@@ -1123,6 +1230,12 @@
             icon("sparkles"),
             t("consolidateAll")
           )
+        ),
+        h(
+          "div",
+          { class: "panel action-panel" },
+          h("div", { class: "action-text" }, h("strong", null, t("migrate")), h("span", null, t("migrateHint"))),
+          h("button", { class: "btn", onclick: function () { openMigration("export"); } }, icon("transfer"), t("open"))
         )
       );
     }
@@ -1168,6 +1281,15 @@
         t("consolidate")
       )
     );
+    actions.push(h("button", { class: "btn", onclick: showHistory }, icon("history"), t("tidyHistory")));
+    actions.push(
+      h(
+        "button",
+        { class: "btn", onclick: migrateScope, disabled: !d.files.length && !(d.forgotten || []).length },
+        icon("transfer"),
+        t("migrateTo")
+      )
+    );
     if (isSession) {
       actions.push(h("button", { class: "btn danger", onclick: purgeSession }, icon("trash"), t("purge")));
     }
@@ -1206,6 +1328,20 @@
     }
     if (isPeople && !d.enabled) {
       notices.push(notice("warn", t("peopleOffNotice")));
+    }
+    const tidy = d.tidy || {};
+    if (tidy.pendingCount && tidy.plan) {
+      notices.push(
+        notice("info", [
+          t("tidyPendingNotice", { n: tidy.pendingCount, time: relTime(tidy.pendingAt) }),
+          h(
+            "div",
+            { class: "notice-actions" },
+            h("button", { class: "btn small primary", onclick: reviewPending }, t("viewPlan")),
+            h("button", { class: "btn small", onclick: dismissPending }, t("dismiss"))
+          ),
+        ])
+      );
     }
 
     const tabs = [["memories", "tabMemories", d.files.length], ["index", "tabIndex", null]];
@@ -2449,6 +2585,12 @@
       ctrl.setFoot(h("button", { class: "btn primary", onclick: function () { ctrl.close(null); } }, t("close")));
       return;
     }
+    showPlan(ctrl, sel, res, existing, false);
+  }
+
+  // 列出修改方案供勾选；fromPending 表示这是定期整理留下待确认的方案
+  function showPlan(ctrl, sel, plan, existing, fromPending) {
+    const ops = plan.operations || [];
     const checks = ops.map(function () { return true; });
     const counter = h("span", { class: "grow" });
     const applyBtn = h("button", { class: "btn primary" }, t("applySelected"));
@@ -2465,7 +2607,7 @@
     });
     ctrl.setBody([
       h("p", null, t("consolidateReview")),
-      res.skipped && res.skipped.length ? notice("warn", t("consolidateSkipped", { n: res.skipped.length })) : null,
+      plan.skipped && plan.skipped.length ? notice("warn", t("consolidateSkipped", { n: plan.skipped.length })) : null,
       h("div", null, rows),
     ]);
     applyBtn.addEventListener("click", async function () {
@@ -2473,29 +2615,51 @@
       ctrl.busy = true;
       applyBtn.disabled = true;
       try {
-        const result = await apiPost("consolidate/apply", { scope: sel.scope, key: sel.key || "", operations: chosen });
+        const result = await apiPost("consolidate/apply", {
+          scope: sel.scope,
+          key: sel.key || "",
+          operations: chosen,
+          fromPending: fromPending,
+        });
         ctrl.busy = false;
         ctrl.close(true);
-        toast(result.message || t("saved"));
-        (result.results || []).forEach(function (item) {
+        const items = result.results || [];
+        toast(t("consolidateAllDone", {
+          ok: items.filter(function (item) { return item.ok; }).length,
+          failed: items.filter(function (item) { return !item.ok; }).length,
+        }));
+        items.forEach(function (item) {
           if (!item.ok) {
             toast(item.file + "：" + item.message, "error");
           }
         });
-        if (isSelected(sel)) {
-          state.editor = null;
-          state.fileQuery = "";
-          state.searchResults = null;
-          await Promise.all([loadDetail(), loadOverview(true)]);
-        }
+        await reloadAfterChange(sel);
       } catch (err) {
         ctrl.busy = false;
         applyBtn.disabled = false;
         toast(err.message, "error");
       }
     });
-    ctrl.setFoot([counter, h("button", { class: "btn", onclick: function () { ctrl.close(null); } }, t("cancel")), applyBtn]);
+    const foot = [counter];
+    if (fromPending) {
+      foot.push(
+        h("button", { class: "btn danger", onclick: function () { ctrl.close(null); dismissPending(); } }, t("dismiss"))
+      );
+    }
+    foot.push(h("button", { class: "btn", onclick: function () { ctrl.close(null); } }, t("cancel")), applyBtn);
+    ctrl.setFoot(foot);
     updateCounter();
+  }
+
+  async function reloadAfterChange(sel) {
+    if (sel && isSelected(sel)) {
+      state.editor = null;
+      state.fileQuery = "";
+      state.searchResults = null;
+      await Promise.all([loadDetail(), loadOverview(true)]);
+    } else {
+      await loadOverview(true);
+    }
   }
 
   function opRow(op, existing, onToggle) {
@@ -2810,6 +2974,1042 @@
     });
     ctrl.setFoot([counter, closeBtn(t("cancel")), applyBtn]);
     updateCounter();
+  }
+
+  // ------------------------------------------------------------ 定期整理
+
+  const TIDY_MODES = ["confirm", "auto", "off"];
+  const KEEP_RUNS = 5;
+
+  function tidyModeName(mode) {
+    return mode === "confirm" ? t("tidyModeConfirm") : mode === "auto" ? t("tidyModeAuto") : t("tidyModeOffLabel");
+  }
+
+  function pendingDot(n) {
+    return n ? h("span", { class: "dot", title: t("tidyPendingBadge") }) : null;
+  }
+
+  function segment(options, value, onChange) {
+    const seg = h("div", { class: "segmented" });
+    let current = value;
+    function draw() {
+      seg.replaceChildren();
+      options.forEach(function (opt) {
+        seg.append(
+          h(
+            "button",
+            {
+              type: "button",
+              class: current === opt[0] ? "active" : "",
+              onclick: function () {
+                if (current !== opt[0]) {
+                  current = opt[0];
+                  draw();
+                  onChange(current);
+                }
+              },
+            },
+            opt[1]
+          )
+        );
+      });
+    }
+    draw();
+    return seg;
+  }
+
+  function checkRow(label, checked, onChange) {
+    return h(
+      "label",
+      { class: "check" },
+      h("input", {
+        type: "checkbox",
+        checked: checked,
+        onchange: function (event) {
+          onChange(event.target.checked);
+        },
+      }),
+      h("span", null, label)
+    );
+  }
+
+  function selectBox(options, value, onChange) {
+    return h(
+      "select",
+      {
+        class: "input",
+        onchange: function (event) {
+          onChange(event.target.value);
+        },
+      },
+      options.map(function (opt) {
+        return h("option", { value: opt[0], selected: opt[0] === value }, opt[1]);
+      })
+    );
+  }
+
+  function policySelect(value, onChange) {
+    return selectBox(
+      ["newer", "skip", "overwrite"].map(function (p) { return [p, t("policy_" + p)]; }),
+      value,
+      onChange
+    );
+  }
+
+  async function saveTidyMode(mode, hours) {
+    const body = { mode: mode };
+    if (hours !== undefined) {
+      body.hours = hours;
+    }
+    const data = await apiPost("autotidy/config", body);
+    if (state.overview) {
+      state.overview.autoTidy = data;
+    }
+    return data;
+  }
+
+  function renderTidyCard(ov) {
+    const cfg = ov.autoTidy || { mode: "off", hours: 24, asked: true, minChanges: 3 };
+    if (!cfg.asked) {
+      const choice = function (mode, hintKey, primary) {
+        return h(
+          "button",
+          {
+            class: "choice" + (primary ? " primary" : ""),
+            onclick: async function (event) {
+              const btn = event.currentTarget;
+              await withBusy(btn, async function () {
+                try {
+                  await saveTidyMode(mode);
+                  toast(mode === "off" ? t("saved") : tidyModeName(mode) + " · " + t("enabled"));
+                  renderMain();
+                } catch (err) {
+                  toast(err.message, "error");
+                }
+              });
+            },
+          },
+          h("strong", null, mode === "off" ? t("tidyModeOff") : tidyModeName(mode), primary ? h("span", { class: "tag ok" }, t("recommended")) : null),
+          h("span", null, t(hintKey))
+        );
+      };
+      return h(
+        "div",
+        { class: "panel ask-card" },
+        h("div", { class: "action-text" }, h("strong", null, t("tidyAskTitle")), h("span", null, t("tidyAskHint", { n: cfg.minChanges }))),
+        h(
+          "div",
+          { class: "choices" },
+          choice("confirm", "tidyModeConfirmHint", true),
+          choice("auto", "tidyModeAutoHint", false),
+          choice("off", "tidyModeOffHint", false)
+        )
+      );
+    }
+    const on = cfg.mode !== "off";
+    return h(
+      "div",
+      { class: "panel action-panel" },
+      h(
+        "div",
+        { class: "action-text" },
+        h("strong", null, t("tidyTitle"), " ", h("span", { class: "tag " + (on ? "ok" : "") }, tidyModeName(cfg.mode))),
+        h("span", null, on ? t("tidyStatusOn", { hours: cfg.hours, n: cfg.minChanges }) : t("tidyStatusOff"))
+      ),
+      h("button", { class: "btn", onclick: tidySettingsDialog }, icon("clock"), t("change"))
+    );
+  }
+
+  function tidySettingsDialog() {
+    const cfg = (state.overview && state.overview.autoTidy) || { mode: "off", hours: 24 };
+    let mode = cfg.mode;
+    const hint = h("div", { class: "hint-line" });
+    function drawHint() {
+      hint.textContent = mode === "confirm" ? t("tidyModeConfirmHint") : mode === "auto" ? t("tidyModeAutoHint") : t("tidyStatusOff");
+    }
+    const hours = h("input", { class: "input", type: "number", min: 1, max: 720, value: cfg.hours, style: "width:120px" });
+    const ctrl = openDialog({
+      title: t("tidyTitle"),
+      body: h(
+        "div",
+        { class: "form-grid" },
+        field(t("modeLabel"), null, h("div", null, segment(TIDY_MODES.map(function (m) { return [m, tidyModeName(m)]; }), mode, function (next) {
+          mode = next;
+          drawHint();
+        }), hint)),
+        field(t("tidyHours"), t("tidyHoursHint"), hours)
+      ),
+    });
+    drawHint();
+    const saveBtn = h("button", { class: "btn primary" }, t("save"));
+    saveBtn.addEventListener("click", function () {
+      withBusy(saveBtn, async function () {
+        try {
+          await saveTidyMode(mode, Number(hours.value) || 24);
+          ctrl.close(true);
+          toast(t("saved"));
+          if (!state.selected) {
+            renderMain();
+          }
+        } catch (err) {
+          toast(err.message, "error");
+        }
+      });
+    });
+    ctrl.setFoot([h("button", { class: "btn", onclick: function () { ctrl.close(null); } }, t("cancel")), saveBtn]);
+  }
+
+  function pendingScopes(ov) {
+    const items = [];
+    if (ov.global && ov.global.tidyPending) {
+      items.push({ scope: "global", key: "", label: t("globalTitle"), n: ov.global.tidyPending });
+    }
+    ((ov.people || {}).platforms || []).forEach(function (p) {
+      if (p.tidyPending) {
+        items.push({ scope: "people", key: p.key, label: t("peopleTitle", { platform: p.platform }), n: p.tidyPending });
+      }
+    });
+    ov.sessions.forEach(function (s) {
+      if (s.tidyPending) {
+        items.push({ scope: "session", key: s.key, label: sessionTitle(s), sub: sessionSub(s), n: s.tidyPending });
+      }
+    });
+    return items;
+  }
+
+  function renderPendingPanel(ov) {
+    const items = pendingScopes(ov);
+    if (!items.length) {
+      return null;
+    }
+    return h(
+      "div",
+      { class: "panel", style: "margin-top:16px" },
+      h("div", { class: "panel-head" }, h("h3", null, t("tidyPendingTitle")), h("span", { class: "count" }, items.length)),
+      h(
+        "div",
+        null,
+        items.map(function (item) {
+          return h(
+            "button",
+            {
+              class: "batch-row clickable",
+              onclick: function () {
+                selectScope({ scope: item.scope, key: item.key });
+              },
+            },
+            pendingDot(1),
+            h(
+              "div",
+              { class: "batch-text" },
+              h("div", { class: "batch-name" }, item.label),
+              item.sub ? h("div", { class: "batch-sub" }, item.sub) : null
+            ),
+            h("span", { class: "tag warn" }, t("runOps", { n: item.n }))
+          );
+        })
+      )
+    );
+  }
+
+  async function reviewPending() {
+    if (!(await confirmDiscard())) {
+      return;
+    }
+    const sel = state.selected;
+    const plan = (state.detail.tidy || {}).plan;
+    if (!plan) {
+      return;
+    }
+    const existing = new Set(state.detail.files.map(function (f) { return f.file; }));
+    const ctrl = openDialog({ title: t("planTitle"), wide: true });
+    showPlan(ctrl, sel, plan, existing, true);
+  }
+
+  async function dismissPending() {
+    const sel = state.selected;
+    const ok = await confirmDialog({ title: t("dismissTitle"), message: t("dismissMessage"), confirm: t("dismiss"), danger: true });
+    if (!ok) {
+      return;
+    }
+    try {
+      await apiPost("autotidy/dismiss", { scope: sel.scope, key: sel.key || "" });
+      toast(t("dismissed"));
+      await reloadAfterChange(sel);
+    } catch (err) {
+      toast(err.message, "error");
+    }
+  }
+
+  function outcomeText(info) {
+    if (info.outcome === "failed") {
+      return t("outcome_failed", { message: info.message || "" });
+    }
+    return info.outcome ? t("outcome_" + info.outcome) : "";
+  }
+
+  function opKind(op) {
+    if (op.op === "delete") {
+      return ["danger", t("opDelete")];
+    }
+    return op.created ? ["ok", t("opCreate")] : ["warn", t("opRewrite")];
+  }
+
+  async function showHistory() {
+    const sel = state.selected;
+    const ctrl = openDialog({ title: t("tidyHistory"), wide: true });
+    ctrl.setFoot(h("button", { class: "btn", onclick: function () { ctrl.close(null); } }, t("close")));
+
+    async function undoRun(run, button) {
+      const ok = await confirmDialog({ title: t("undoTitle"), message: t("undoMessage"), confirm: t("undo"), danger: true });
+      if (!ok) {
+        return;
+      }
+      await withBusy(button, async function () {
+        try {
+          const res = await apiPost("tidy/undo", { scope: sel.scope, key: sel.key || "", id: run.id });
+          const items = res.results || [];
+          toast(t("undoDone", { ok: items.filter(function (i) { return i.ok; }).length, total: items.length }));
+          items.forEach(function (item) {
+            if (!item.ok) {
+              toast(item.file + "：" + item.message, "error");
+            }
+          });
+          await reloadAfterChange(sel);
+          if (ctrl.isOpen()) {
+            await load();
+          }
+        } catch (err) {
+          toast(err.message, "error");
+        }
+      });
+    }
+
+    function runCard(run) {
+      const undoBtn = run.undoneAt
+        ? h("span", { class: "tag" }, t("undone"))
+        : h("button", { class: "btn small", onclick: function (event) { undoRun(run, event.currentTarget); } }, icon("rotate"), t("undo"));
+      return h(
+        "div",
+        { class: "run-card" + (run.undoneAt ? " undone" : "") },
+        h(
+          "div",
+          { class: "run-head" },
+          h(
+            "div",
+            { class: "grow" },
+            h("strong", null, fmtTime(run.at)),
+            " ",
+            h("span", { class: "tag" }, t("trigger_" + run.trigger)),
+            " ",
+            h("span", { class: "batch-sub" }, t("runOps", { n: run.ops.length }))
+          ),
+          undoBtn
+        ),
+        run.ops.map(function (op) {
+          const kind = opKind(op);
+          return h(
+            "div",
+            { class: "run-op" },
+            h("span", { class: "tag " + kind[0] }, kind[1]),
+            h("span", { class: "file-name", style: "flex:none" }, op.file),
+            op.reason ? h("span", { class: "op-reason" }, op.reason) : null
+          );
+        })
+      );
+    }
+
+    async function load() {
+      ctrl.setBody(spinnerBlock());
+      let res;
+      try {
+        res = await apiGet("tidy/runs", { scope: sel.scope, key: sel.key || "" });
+      } catch (err) {
+        ctrl.setBody(notice("warn", err.message));
+        return;
+      }
+      if (!ctrl.isOpen()) {
+        return;
+      }
+      const info = res.tidy || {};
+      const last = Math.max(info.lastRun || 0, info.lastAttempt || 0);
+      const parts = [];
+      if (last && info.outcome) {
+        parts.push(notice("info", t("historyLast", { time: fmtTime(last), result: outcomeText(info) })));
+      }
+      const runs = res.runs || [];
+      if (!runs.length) {
+        parts.push(emptyState("history", t("historyEmptyTitle"), t("historyEmptyHint", { n: KEEP_RUNS })));
+      }
+      runs.forEach(function (run) {
+        parts.push(runCard(run));
+      });
+      ctrl.setBody(parts);
+    }
+
+    await load();
+  }
+
+  // ------------------------------------------------------------ 迁移与备份
+
+  const OUTCOMES = ["added", "replaced", "same", "kept", "invalid"];
+
+  function scopeTitle(item) {
+    if (item.scope === "global") {
+      return t("globalTitle");
+    }
+    if (item.scope === "people") {
+      return t("peopleTitle", { platform: item.platform || item.key });
+    }
+    return sessionTitle(item);
+  }
+
+  function countsLine(counts) {
+    const bits = OUTCOMES.filter(function (k) { return counts && counts[k]; }).map(function (k) {
+      return t("cnt_" + k, { n: counts[k] });
+    });
+    return bits.length ? bits.join(" · ") : t("cntNone");
+  }
+
+  function landed(counts) {
+    return (counts.added || 0) + (counts.replaced || 0);
+  }
+
+  function issuesBlock(issues) {
+    if (!issues || !issues.length) {
+      return null;
+    }
+    return h(
+      "details",
+      { class: "issues" },
+      h("summary", null, t("issuesCount", { n: issues.length })),
+      h(
+        "div",
+        null,
+        issues.map(function (item) {
+          return h("div", { class: "batch-sub" }, h("code", null, item.name), " ", item.reason);
+        })
+      )
+    );
+  }
+
+  function allScopes() {
+    const ov = state.overview;
+    if (!ov) {
+      return [];
+    }
+    const items = [{ scope: "global", key: "", fileCount: ov.global.fileCount }];
+    ((ov.people || {}).platforms || []).forEach(function (p) {
+      items.push({ scope: "people", key: p.key, platform: p.platform, fileCount: p.fileCount });
+    });
+    ov.sessions
+      .slice()
+      .sort(function (a, b) {
+        return Math.max(b.lastActive, b.updatedAt) - Math.max(a.lastActive, a.updatedAt);
+      })
+      .forEach(function (s) {
+        items.push(Object.assign({ scope: "session" }, s));
+      });
+    return items;
+  }
+
+  async function saveBackup(token, filename) {
+    if (typeof bridge.download === "function") {
+      try {
+        await bridge.download("export/file", { token: token }, filename);
+        return;
+      } catch (err) {
+        // 宿主没有下载能力时退回页面内生成文件
+      }
+    }
+    const data = await apiGet("export/file", { token: token });
+    const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: "application/json" }));
+    const link = h("a", { href: url, download: filename, style: "display:none" });
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(function () {
+      URL.revokeObjectURL(url);
+    }, 1000);
+  }
+
+  function pickList(items, render, onChange) {
+    const checks = items.map(function () { return true; });
+    const rows = items.map(function (item, i) {
+      return h(
+        "label",
+        { class: "batch-row pick" },
+        h("input", {
+          type: "checkbox",
+          checked: true,
+          onchange: function (event) {
+            checks[i] = event.target.checked;
+            onChange();
+          },
+        }),
+        render(item)
+      );
+    });
+    return {
+      el: h("div", { class: "batch-list" }, rows),
+      chosen: function () {
+        return items.filter(function (item, i) { return checks[i]; });
+      },
+    };
+  }
+
+  function openMigration(tab) {
+    const ctrl = openDialog({ title: t("migrate"), wide: true });
+    const content = h("div");
+    const tabs = segment(
+      [["export", t("tabExport")], ["import", t("tabImport")], ["platform", t("tabPlatform")]],
+      tab,
+      function (next) {
+        show(next);
+      }
+    );
+    ctrl.setBody([h("div", { class: "migrate-tabs" }, tabs), content]);
+    function closeBtn() {
+      return h("button", { class: "btn", onclick: function () { ctrl.close(null); } }, t("close"));
+    }
+    function show(name) {
+      content.replaceChildren();
+      ctrl.setFoot(closeBtn());
+      if (name === "export") {
+        exportTab(ctrl, content, closeBtn);
+      } else if (name === "import") {
+        importTab(ctrl, content, closeBtn);
+      } else {
+        platformTab(ctrl, content, closeBtn);
+      }
+    }
+    show(tab);
+  }
+
+  function exportTab(ctrl, box, closeBtn) {
+    const scopes = allScopes().filter(function (item) { return item.fileCount > 0; });
+    box.append(h("p", null, t("exportHint")));
+    if (!scopes.length) {
+      box.append(emptyState("inbox", t("exportNone")));
+      return;
+    }
+    let includeForgotten = true;
+    const counter = h("span", { class: "grow" });
+    const exportBtn = h("button", { class: "btn primary" }, icon("archive"), t("exportButton"));
+    const picker = pickList(
+      scopes,
+      function (item) {
+        return h(
+          "div",
+          { class: "batch-text" },
+          h("div", { class: "batch-name" }, scopeTitle(item)),
+          h("div", { class: "batch-sub" }, t("fileCount", { n: item.fileCount }))
+        );
+      },
+      update
+    );
+    function update() {
+      const n = picker.chosen().length;
+      counter.textContent = t("selectedCount", { n: n, total: scopes.length });
+      exportBtn.disabled = n === 0;
+    }
+    box.append(
+      field(t("exportScopes"), null, picker.el),
+      checkRow(t("includeForgotten"), true, function (value) { includeForgotten = value; })
+    );
+    exportBtn.addEventListener("click", function () {
+      withBusy(exportBtn, async function () {
+        const chosen = picker.chosen();
+        const body = { includeForgotten: includeForgotten };
+        if (chosen.length < scopes.length) {
+          body.scopes = chosen.map(function (item) { return { scope: item.scope, key: item.key || "" }; });
+        }
+        try {
+          const res = await apiPost("export/prepare", body);
+          await saveBackup(res.token, res.filename);
+          toast(t("exported", { n: res.fileCount }));
+        } catch (err) {
+          toast(err.message, "error");
+        }
+      });
+    });
+    ctrl.setFoot([counter, closeBtn(), exportBtn]);
+    update();
+  }
+
+  function importTab(ctrl, box, closeBtn) {
+    let token = "";
+    let policy = "newer";
+    let picker = null;
+    const result = h("div", { class: "migrate-result" });
+    const counter = h("span", { class: "grow" });
+    const importBtn = h("button", { class: "btn primary", disabled: true }, t("importButton"));
+    const fileInput = h("input", {
+      type: "file",
+      accept: ".json,application/json",
+      style: "display:none",
+      onchange: async function (event) {
+        const file = event.target.files && event.target.files[0];
+        event.target.value = "";
+        if (!file) {
+          return;
+        }
+        let bundle;
+        try {
+          bundle = JSON.parse(await file.text());
+        } catch (err) {
+          toast(t("badBackup", { message: err.message }), "error");
+          return;
+        }
+        fileName.textContent = file.name;
+        await preview({ bundle: bundle });
+      },
+    });
+    const fileName = h("span", { class: "batch-sub" });
+    const chooseBtn = h("button", { class: "btn", onclick: function () { fileInput.click(); } }, icon("file"), t("chooseFile"));
+    const policyEl = policySelect(policy, function (value) {
+      policy = value;
+      if (token) {
+        preview({ token: token });
+      }
+    });
+
+    function update() {
+      const n = picker ? picker.chosen().length : 0;
+      counter.textContent = picker ? t("selectedCount", { n: n, total: picker.total }) : "";
+      importBtn.disabled = !token || n === 0;
+    }
+
+    async function preview(body) {
+      result.replaceChildren(spinnerBlock());
+      importBtn.disabled = true;
+      try {
+        const res = await apiPost("import/preview", Object.assign({ policy: policy }, body));
+        token = res.token;
+        const scopes = res.scopes || [];
+        picker = pickList(
+          scopes,
+          function (item) {
+            return h(
+              "div",
+              { class: "batch-text" },
+              h("div", { class: "batch-name" }, scopeTitle(item)),
+              h(
+                "div",
+                { class: "batch-sub" },
+                t("fileCount", { n: item.fileCount }),
+                item.forgottenCount ? " · " + t("forgottenIncluded", { n: item.forgottenCount }) : "",
+                " → ",
+                countsLine(item.counts)
+              ),
+              issuesBlock(item.issues)
+            );
+          },
+          update
+        );
+        picker.total = scopes.length;
+        result.replaceChildren(picker.el);
+      } catch (err) {
+        token = "";
+        picker = null;
+        result.replaceChildren(notice("warn", err.message));
+      }
+      update();
+    }
+
+    importBtn.addEventListener("click", function () {
+      ctrl.busy = true;
+      withBusy(importBtn, async function () {
+        try {
+          const selection = picker.chosen().map(function (item) { return { scope: item.scope, key: item.key || "" }; });
+          const res = await apiPost("import/apply", { token: token, policy: policy, selection: selection });
+          const n = (res.reports || []).reduce(function (sum, r) { return sum + landed(r.counts); }, 0);
+          toast(n ? t("imported", { n: n }) : t("importNothing"));
+          ctrl.busy = false;
+          ctrl.close(true);
+          await reloadAfterChange(state.selected);
+        } catch (err) {
+          toast(err.message, "error");
+        } finally {
+          ctrl.busy = false;
+        }
+      });
+    });
+
+    box.append(
+      h("p", null, t("importHint")),
+      h("div", { class: "row-wrap" }, chooseBtn, fileName, fileInput),
+      field(t("policy"), null, policyEl),
+      result
+    );
+    ctrl.setFoot([counter, closeBtn(), importBtn]);
+  }
+
+  async function platformTab(ctrl, box, closeBtn) {
+    box.append(h("p", null, t("platformHint")));
+    const body = h("div", null, spinnerBlock());
+    box.append(body);
+    let info;
+    try {
+      info = await apiGet("migrate/info");
+    } catch (err) {
+      body.replaceChildren(notice("warn", err.message));
+      return;
+    }
+    const platforms = info.platforms || [];
+    if (!platforms.length) {
+      body.replaceChildren(emptyState("inbox", t("platformNone")));
+      return;
+    }
+    const opts = { from: platforms[0].platform, to: "", mode: "move", policy: "newer", includePeople: true };
+    let previewed = false;
+    const result = h("div", { class: "migrate-result" });
+    const previewBtn = h("button", { class: "btn" }, t("preview"));
+    const runBtn = h("button", { class: "btn primary", disabled: true }, t("runMigrate"));
+    function dirty() {
+      previewed = false;
+      runBtn.disabled = true;
+      result.replaceChildren();
+      // 占位提示一个和旧 ID 不同的、当前启用的机器人
+      toInput.placeholder = (info.adapters || []).filter(function (id) { return id !== opts.from; })[0] || "";
+    }
+    const listId = "mb-adapters";
+    const toInput = h("input", {
+      class: "input",
+      list: listId,
+      spellcheck: "false",
+      autocomplete: "off",
+      oninput: function (event) {
+        opts.to = event.target.value.trim();
+        dirty();
+      },
+    });
+    const datalist = h(
+      "datalist",
+      { id: listId },
+      (info.adapters || []).map(function (id) { return h("option", { value: id }); })
+    );
+    dirty();
+    body.replaceChildren(
+      h(
+        "div",
+        { class: "form-grid two" },
+        field(
+          t("platformFrom"),
+          null,
+          selectBox(
+            platforms.map(function (p) {
+              return [p.platform, p.platform + (p.sessions ? " · " + t("platformSessions", { n: p.sessions }) : "")];
+            }),
+            opts.from,
+            function (value) {
+              opts.from = value;
+              dirty();
+            }
+          )
+        ),
+        field(t("platformTo"), t("platformToHint"), h("div", null, toInput, datalist)),
+        field(t("modeLabel"), null, segment([["move", t("modeMove")], ["copy", t("modeCopy")]], opts.mode, function (value) {
+          opts.mode = value;
+          dirty();
+        })),
+        field(t("policy"), null, policySelect(opts.policy, function (value) {
+          opts.policy = value;
+          dirty();
+        }))
+      ),
+      checkRow(t("includePeople"), true, function (value) {
+        opts.includePeople = value;
+        dirty();
+      }),
+      h("div", { class: "hint-line" }, t("moveHint")),
+      result
+    );
+
+    async function send(dryRun) {
+      return apiPost("migrate/platform", {
+        from: opts.from,
+        to: opts.to,
+        mode: opts.mode,
+        policy: opts.policy,
+        includePeople: opts.includePeople,
+        dryRun: dryRun,
+      });
+    }
+
+    previewBtn.addEventListener("click", function () {
+      withBusy(previewBtn, async function () {
+        result.replaceChildren(spinnerBlock());
+        try {
+          const res = await send(true);
+          const items = res.items || [];
+          const parts = [];
+          if (!items.length) {
+            parts.push(notice("info", t("migrateNothing")));
+          } else {
+            parts.push(h("p", null, t("migratePreview", { n: items.length })));
+            parts.push(
+              h(
+                "div",
+                { class: "batch-list" },
+                items.map(function (item) {
+                  return h(
+                    "div",
+                    { class: "batch-row" },
+                    h(
+                      "div",
+                      { class: "batch-text" },
+                      h("div", { class: "batch-name" }, scopeTitle(item.from)),
+                      h("div", { class: "batch-sub" }, (item.from.umo || item.from.key) + " → " + (item.to.umo || item.to.key)),
+                      issuesBlock(item.issues)
+                    ),
+                    h("span", { class: "tag" }, countsLine(item.counts))
+                  );
+                })
+              )
+            );
+          }
+          const skipped = res.skipped || [];
+          if (skipped.length) {
+            parts.push(
+              notice("warn", [
+                t("migrateSkipped", { n: skipped.length }),
+                h("div", null, skipped.map(function (item) { return h("div", null, h("code", null, item.key)); })),
+              ])
+            );
+          }
+          result.replaceChildren();
+          append(result, parts);
+          previewed = items.length > 0;
+          runBtn.disabled = !previewed;
+        } catch (err) {
+          result.replaceChildren(notice("warn", err.message));
+        }
+      });
+    });
+
+    runBtn.addEventListener("click", function () {
+      if (!previewed) {
+        return;
+      }
+      ctrl.busy = true;
+      withBusy(runBtn, async function () {
+        try {
+          const res = await send(false);
+          const totals = res.totals || {};
+          toast(t("migrated", { n: landed(totals) }));
+          ctrl.busy = false;
+          ctrl.close(true);
+          await loadOverview(true);
+          // 正在看的会话被整个搬走了就回到首页
+          const sel = state.selected;
+          if (sel && sel.scope !== "global" && !allScopes().some(function (item) { return sameScope(item, sel); })) {
+            state.selected = null;
+            resetDetailState();
+            backToList();
+            renderSessionList();
+            renderMain();
+          } else {
+            await reloadAfterChange(sel);
+          }
+        } catch (err) {
+          toast(err.message, "error");
+        } finally {
+          ctrl.busy = false;
+        }
+      });
+    });
+    ctrl.setFoot([h("span", { class: "grow" }), closeBtn(), previewBtn, runBtn]);
+  }
+
+  async function migrateScope() {
+    if (!(await confirmDiscard())) {
+      return;
+    }
+    const sel = state.selected;
+    const d = state.detail;
+    const files = d.files.map(function (f) { return f.file; });
+    const forgotten = (d.forgotten || []).map(function (f) { return f.file; });
+    const targets = allScopes().filter(function (item) { return !sameScope(item, sel); });
+    const NEW_SESSION = "+session";
+    const NEW_PEOPLE = "+people";
+    const opts = { target: "", umo: "", platform: "", mode: "copy", policy: "newer", includeForgotten: true };
+    let previewed = false;
+    const ctrl = openDialog({ title: t("migrateTo"), wide: true });
+    const result = h("div", { class: "migrate-result" });
+    const previewBtn = h("button", { class: "btn" }, t("preview"));
+    const runBtn = h("button", { class: "btn primary", disabled: true }, t("runMigrate"));
+    function dirty() {
+      previewed = false;
+      runBtn.disabled = true;
+      result.replaceChildren();
+    }
+    const umoInput = h("input", {
+      class: "input",
+      spellcheck: "false",
+      autocomplete: "off",
+      placeholder: "aiocqhttp:GroupMessage:123456",
+      oninput: function (event) {
+        opts.umo = event.target.value.trim();
+        dirty();
+      },
+    });
+    const platformInput = h("input", {
+      class: "input",
+      spellcheck: "false",
+      autocomplete: "off",
+      oninput: function (event) {
+        opts.platform = event.target.value.trim();
+        dirty();
+      },
+    });
+    const umoField = field(t("targetUmo"), t("targetUmoHint"), umoInput);
+    const platformField = field(t("targetPlatform"), null, platformInput);
+    function drawExtra() {
+      umoField.style.display = opts.target === NEW_SESSION ? "" : "none";
+      platformField.style.display = opts.target === NEW_PEOPLE ? "" : "none";
+    }
+    const targetOptions = [["", "—"]]
+      .concat(
+        targets.map(function (item) {
+          const id = item.scope + ":" + (item.key || "");
+          return [id, scopeTitle(item) + (item.scope === "session" && item.platform ? " · " + item.platform : "")];
+        })
+      )
+      .concat([[NEW_SESSION, t("targetNewSession")], [NEW_PEOPLE, t("targetNewPeople")]]);
+    const targetEl = selectBox(targetOptions, "", function (value) {
+      opts.target = value;
+      previewBtn.disabled = !value;
+      drawExtra();
+      dirty();
+    });
+    previewBtn.disabled = true;
+
+    let picker = null;
+    let filesBlock = null;
+    if (files.length > 1) {
+      const counter = h("small");
+      picker = pickList(
+        files,
+        function (file) {
+          return h("div", { class: "batch-text" }, h("div", { class: "file-name" }, file));
+        },
+        function () {
+          counter.textContent = t("selectedFiles", { n: picker.chosen().length, total: files.length });
+          dirty();
+        }
+      );
+      counter.textContent = t("selectedFiles", { n: files.length, total: files.length });
+      filesBlock = h("div", { class: "field" }, h("label", null, h("span", null, t("filesLabel")), counter), picker.el);
+    }
+
+    ctrl.setBody(
+      h(
+        "div",
+        null,
+        h("p", null, t("migrateScopeHint")),
+        h(
+          "div",
+          { class: "form-grid two" },
+          field(t("targetLabel"), null, targetEl),
+          field(t("modeLabel"), null, segment([["copy", t("modeCopy")], ["move", t("modeMove")]], opts.mode, function (value) {
+            opts.mode = value;
+            dirty();
+          })),
+          umoField,
+          platformField,
+          field(t("policy"), null, policySelect(opts.policy, function (value) {
+            opts.policy = value;
+            dirty();
+          }))
+        ),
+        filesBlock,
+        forgotten.length
+          ? checkRow(t("includeForgotten"), true, function (value) {
+              opts.includeForgotten = value;
+              dirty();
+            })
+          : null,
+        h("div", { class: "hint-line" }, t("moveHint")),
+        result
+      )
+    );
+    drawExtra();
+
+    function payload(dryRun) {
+      let to;
+      if (opts.target === NEW_SESSION) {
+        to = { umo: opts.umo };
+      } else if (opts.target === NEW_PEOPLE) {
+        to = { scope: "people", platform: opts.platform };
+      } else {
+        const idx = opts.target.indexOf(":");
+        to = { scope: opts.target.slice(0, idx), key: opts.target.slice(idx + 1) };
+      }
+      const body = {
+        from: { scope: sel.scope, key: sel.key || "" },
+        to: to,
+        mode: opts.mode,
+        policy: opts.policy,
+        includeForgotten: opts.includeForgotten,
+        dryRun: dryRun,
+      };
+      if (picker && picker.chosen().length < files.length) {
+        body.files = picker.chosen();
+      }
+      return body;
+    }
+
+    previewBtn.addEventListener("click", function () {
+      withBusy(previewBtn, async function () {
+        result.replaceChildren(spinnerBlock());
+        try {
+          const res = await apiPost("migrate/scope", payload(true));
+          result.replaceChildren(
+            h(
+              "div",
+              { class: "batch-list" },
+              h(
+                "div",
+                { class: "batch-row" },
+                h(
+                  "div",
+                  { class: "batch-text" },
+                  h("div", { class: "batch-name" }, scopeTitle(res.from) + " → " + scopeTitle(res.to)),
+                  issuesBlock(res.issues)
+                ),
+                h("span", { class: "tag" }, countsLine(res.counts))
+              )
+            )
+          );
+          previewed = landed(res.counts) > 0 || (opts.mode === "move" && (res.counts.same || 0) > 0);
+          runBtn.disabled = !previewed;
+        } catch (err) {
+          result.replaceChildren(notice("warn", err.message));
+        }
+      });
+    });
+
+    runBtn.addEventListener("click", function () {
+      if (!previewed) {
+        return;
+      }
+      ctrl.busy = true;
+      withBusy(runBtn, async function () {
+        try {
+          const res = await apiPost("migrate/scope", payload(false));
+          toast(t("migrated", { n: landed(res.counts) }));
+          ctrl.busy = false;
+          ctrl.close(true);
+          await reloadAfterChange(sel);
+        } catch (err) {
+          toast(err.message, "error");
+        } finally {
+          ctrl.busy = false;
+        }
+      });
+    });
+    ctrl.setFoot([h("span", { class: "grow" }), h("button", { class: "btn", onclick: function () { ctrl.close(null); } }, t("cancel")), previewBtn, runBtn]);
   }
 
   // ------------------------------------------------------------ 启动

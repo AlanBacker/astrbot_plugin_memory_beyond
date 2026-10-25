@@ -153,3 +153,27 @@ class ArchiveStore:
         folder = self._dir(key)
         if folder.is_dir():
             shutil.rmtree(folder)
+
+    def transfer(self, src_key: str, dst_key: str, move: bool = False) -> int:
+        """把一个会话的归档并进另一个会话（平台改名迁移用），返回并入的份数。
+
+        目标已有的同 ID 归档不覆盖；move 时并完删掉源目录。
+        """
+        src = self._dir(src_key)
+        if src_key == dst_key or not src.is_dir():
+            return 0
+        dst = self._dir(dst_key)
+        dst.mkdir(parents=True, exist_ok=True)
+        count = 0
+        for path in sorted(src.glob(f"*{ARCHIVE_SUFFIX}")):
+            target = dst / path.name
+            if target.exists():
+                continue
+            if move:
+                path.replace(target)
+            else:
+                shutil.copy2(path, target)
+            count += 1
+        if move:
+            shutil.rmtree(src, ignore_errors=True)
+        return count

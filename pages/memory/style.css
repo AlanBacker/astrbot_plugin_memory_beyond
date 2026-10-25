@@ -733,7 +733,7 @@ svg.icon {
   gap: 14px;
 }
 
-.field label {
+.field > label {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
@@ -744,7 +744,7 @@ svg.icon {
   font-weight: 600;
 }
 
-.field label small {
+.field > label small {
   color: var(--text-3);
   font-weight: 400;
 }
@@ -1260,6 +1260,7 @@ svg.icon {
   gap: 16px;
   flex-wrap: wrap;
   margin-top: 16px;
+  padding: 14px 16px;
 }
 
 .action-text {
@@ -1340,4 +1341,193 @@ svg.icon {
 .batch-group-head span {
   color: var(--text-2);
   font-size: 12px;
+}
+
+/* 定期整理：首次询问、状态、待确认方案与整理记录 */
+.dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--warn);
+}
+
+.ask-card {
+  margin-top: 16px;
+  padding: 14px 16px;
+}
+
+.choices {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.choice {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  text-align: left;
+  cursor: pointer;
+}
+
+.choice:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.choice:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.choice.primary {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.choice strong {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13.5px;
+}
+
+.choice > span {
+  color: var(--text-2);
+  font-size: 12.5px;
+}
+
+.notice-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.batch-row.clickable {
+  width: 100%;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.batch-row.clickable:last-child {
+  border-bottom: 0;
+}
+
+.batch-row.clickable:hover,
+.batch-row.pick:hover {
+  background: var(--surface-2);
+}
+
+.batch-row.pick {
+  cursor: pointer;
+}
+
+.run-card {
+  margin-top: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+
+.run-card.undone {
+  opacity: 0.6;
+}
+
+.run-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.run-head .grow {
+  flex: 1;
+  min-width: 0;
+}
+
+.run-op {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 7px 12px;
+  font-size: 13px;
+}
+
+.run-op .op-reason {
+  margin: 0;
+}
+
+/* 迁移与备份 */
+.migrate-tabs {
+  margin-bottom: 12px;
+}
+
+.migrate-result:not(:empty) {
+  margin-top: 12px;
+}
+
+.form-grid {
+  display: grid;
+  gap: 14px;
+  margin: 12px 0;
+}
+
+.form-grid.two {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.form-grid select.input,
+.form-grid .input {
+  width: 100%;
+}
+
+.check {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+  color: var(--text);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.hint-line {
+  margin-top: 8px;
+  color: var(--text-3);
+  font-size: 12.5px;
+}
+
+.row-wrap {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 10px 0 14px;
+}
+
+.issues {
+  margin-top: 4px;
+  font-size: 12px;
+}
+
+.issues summary {
+  color: var(--warn);
+  cursor: pointer;
+}
+
+@media (max-width: 860px) {
+  .form-grid.two {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }

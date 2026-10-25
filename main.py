@@ -32,7 +32,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star, StarTools
 
-from .core import archive, compress, memstore, prompts, recall, registry, tokens
+from .core import archive, compress, memstore, prompts, recall, registry, tidy, tokens
 from .core.turns import split_leading_system, split_turns
 from .web_api import MemoryDashboard
 
@@ -148,6 +148,11 @@ class MemoryBeyondPlugin(Star):
         self._warned_threshold = False
         # 作用域目录 -> 上次遗忘扫描时间
         self._last_sweep: dict[Path, float] = {}
+        # 定期整理：每处的记录与进行中标记；作用域 -> 上次检查时间；
+        # 模型调用一次只跑一处，避免一波消息同时触发好几次复盘
+        self._tidy = tidy.TidyBook(data_dir / "tidy")
+        self._tidy_checked: dict[str, float] = {}
+        self._tidy_gate = asyncio.Semaphore(1)
         self.dashboard = MemoryDashboard(self)
         self.dashboard.register()
 
@@ -411,6 +416,43 @@ class MemoryBeyondPlugin(Star):
     def _forget_after_days(self) -> int:
         return max(1, self._int("forget_after_days", FORGET_DEFAULT_DAYS))
 
+    def tidy_mode(self) -> str:
+        """定期整理方式：off 关闭（默认）、confirm 有方案先问管理员、auto 直接应用。"""
+        return tidy.normalize_mode(self._str("auto_consolidate", tidy.MODE_OFF))
+
+    def tidy_hours(self) -> int:
+        return tidy.clamp_hours(
+            self._int("auto_consolidate_hours", tidy.DEFAULT_HOURS)
+        )
+
+    async def save_tidy_settings(self, mode: str, hours: int | None) -> None:
+        """管理页改定期整理设置：写回插件配置，配置页里看到的随之变化。"""
+        self.config["auto_consolidate"] = mode
+        if hours is not None:
+            self.config["auto_consolidate_hours"] = hours
+        self._tidy_checked.clear()
+        saver = getattr(self.config, "save_config", None)
+        if callable(saver):
+            await asyncio.to_thread(saver)
+
+    def platform_ids(self) -> list[str]:
+        """当前启用的机器人（平台适配器）ID，迁移时给管理员选。"""
+        manager = getattr(self.context, "platform_manager", None)
+        try:
+            getter = getattr(manager, "get_insts", None)
+            insts = getter() if callable(getter) else getattr(manager, "platform_insts", [])
+        except Exception:  # noqa: BLE001 - 平台管理器的实现随版本变化
+            return []
+        ids: list[str] = []
+        for inst in insts or []:
+            try:
+                platform_id = str(getattr(inst.meta(), "id", "") or "")
+            except Exception:  # noqa: BLE001
+                continue
+            if platform_id and platform_id not in ids:
+                ids.append(platform_id)
+        return ids
+
     def _guidance(self) -> str:
         return prompts.memory_guidance(
             self._global_on(), self._people_on(), self._forgetting_on()
@@ -547,6 +589,8 @@ class MemoryBeyondPlugin(Star):
             self._maybe_extract(rt, umo, contexts, n_system, now)
             # ---- 遗忘扫描：长期没用到的记忆退出索引与召回（后台，按目录节流） ----
             self._maybe_forget(umo, now)
+            # ---- 定期整理：到了时间又攒够新记忆的作用域在后台复盘 ----
+            self._maybe_tidy(umo, now)
 
         # ---- 记忆索引块（对话内快照；新对话、压缩后、WebUI 改动后从磁盘刷新） ----
         index_msg = None
@@ -874,6 +918,130 @@ class MemoryBeyondPlugin(Star):
             )
             self._invalidate_index_cache(key)
         return total
+
+    # ============================================================ 定期整理
+
+    def _maybe_tidy(self, umo: str, now: float) -> None:
+        """本会话涉及的每个作用域至多每隔几分钟看一眼该不该整理，要整理的放后台。"""
+        mode = self.tidy_mode()
+        if mode == tidy.MODE_OFF:
+            return
+        # (作用域, 目录名, 索引快照要作废的会话)；含义同 _maybe_forget
+        targets: list[tuple[str, str | None, str | None]] = [
+            ("session", self._store.session_scope(umo).root.name, umo)
+        ]
+        if self._global_on():
+            targets.append(("global", None, None))
+        if self._people_on():
+            targets.append(("people", self._people_scope(umo).root.name, ""))
+        due = []
+        for scope, key, cache_key in targets:
+            sid = tidy.scope_id(scope, key)
+            if now - self._tidy_checked.get(sid, 0.0) < tidy.SCAN_INTERVAL:
+                continue
+            self._tidy_checked[sid] = now
+            due.append((scope, key, cache_key))
+        if due:
+            self._spawn(self._auto_tidy(due, mode), f"tidy:{umo}")
+
+    async def _auto_tidy(
+        self, targets: list[tuple[str, str | None, str | None]], mode: str
+    ) -> None:
+        async with self._tidy_gate:
+            for scope, key, cache_key in targets:
+                try:
+                    await self.tidy_scope(scope, key, cache_key, mode)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 - 定期整理失败不影响对话
+                    logger.warning(
+                        LOG_PREFIX + f"定期整理 {tidy.scope_id(scope, key)} 出错",
+                        exc_info=True,
+                    )
+
+    def _tidy_store(self, scope: str, key: str | None) -> memstore.ScopeStore | None:
+        if scope == "global":
+            return self._global_scope()
+        if scope == "people":
+            return self._store.people_scope_by_key(key or "")
+        return self._store.session_scope_by_key(key or "")
+
+    async def tidy_scope(
+        self, scope: str, key: str | None, cache_key: str | None, mode: str
+    ) -> str:
+        """对一个作用域做一次定期整理，返回结论；没到时候或正忙返回空串。
+
+        模型认为不需要整理就什么都不改；confirm 把方案留给管理员确认，
+        auto 直接应用并记一份可撤销的记录。
+        """
+        store = self._tidy_store(scope, key)
+        if store is None:
+            return ""
+        book = self._tidy
+        sid = tidy.scope_id(scope, key)
+        now = time.time()
+        meta, headers = await asyncio.to_thread(
+            lambda: (book.meta(sid), store.headers())
+        )
+        if not headers or tidy.due_reason(meta, headers, now, self.tidy_hours()):
+            return ""
+        if not book.claim(sid):
+            return ""
+        try:
+            record = self._registry.get(key or "") if scope == "session" else None
+            try:
+                proposal = await tidy.propose(
+                    store, tidy.scope_label(scope, key, record), self.call_consolidator
+                )
+            except tidy.TidyError as exc:
+
+                def failed(meta: tidy.TidyMeta) -> None:
+                    meta.last_attempt = now
+                    meta.failures += 1
+                    meta.outcome = tidy.OUTCOME_FAILED
+                    meta.message = str(exc)
+
+                await asyncio.to_thread(book.update_meta, sid, failed)
+                logger.warning(LOG_PREFIX + f"定期整理 {sid} 失败：{exc}")
+                return tidy.OUTCOME_FAILED
+            ops = proposal.operations
+            pending = None
+            if not ops:
+                outcome, message = tidy.OUTCOME_NOTHING, "模型认为不需要整理"
+            elif mode == tidy.MODE_CONFIRM:
+                pending = {
+                    "createdAt": round(time.time(), 3),
+                    "operations": [op.to_dict() for op in ops],
+                    "skipped": proposal.skipped,
+                    "files": proposal.files,
+                }
+                outcome, message = tidy.OUTCOME_PENDING, f"有 {len(ops)} 项修改等你确认"
+            else:
+                results = await tidy.apply(store, ops, people=scope == "people")
+                run = tidy.make_run(tidy.TRIGGER_AUTO, results, time.time())
+                if run is not None:
+                    await asyncio.to_thread(book.add_run, sid, run)
+                done = sum(1 for item in results if item["ok"])
+                outcome = tidy.OUTCOME_APPLIED
+                message = f"自动应用了 {done} / {len(results)} 项修改"
+                self._invalidate_index_cache(cache_key)
+            # 计时从整理结束算起：这次自己写的文件不算下一轮的"新记忆"
+            finished = time.time()
+
+            def succeeded(meta: tidy.TidyMeta) -> None:
+                meta.last_run = finished
+                meta.last_attempt = now
+                meta.failures = 0
+                meta.outcome = outcome
+                meta.message = message
+                if pending is not None:
+                    meta.pending = pending
+
+            await asyncio.to_thread(book.update_meta, sid, succeeded)
+            logger.info(LOG_PREFIX + f"定期整理 {sid}：{message}")
+            return outcome
+        finally:
+            book.release(sid)
 
     async def _select_by_model(
         self,
@@ -1767,6 +1935,7 @@ class MemoryBeyondPlugin(Star):
             f"相关记忆召回：{self._recall_label()}",
             f"后台记忆提取：{self._extract_label(state)}",
             f"记忆遗忘：{self._forget_label(umo)}",
+            f"定期整理：{self._tidy_label(umo)}",
             "记忆管理页：AstrBot WebUI 侧边栏「插件页面」",
         ]
         yield event.plain_result("\n".join(lines))
@@ -1776,6 +1945,22 @@ class MemoryBeyondPlugin(Star):
             return "关闭"
         count = len(self._store.session_scope(umo).forgotten_files())
         return f"{self._forget_after_days()} 天没用到即遗忘（本会话已遗忘 {count} 条）"
+
+    def _tidy_label(self, umo: str) -> str:
+        mode = self.tidy_mode()
+        if mode == tidy.MODE_OFF:
+            return "关闭"
+        name = "有方案先问管理员" if mode == tidy.MODE_CONFIRM else "有方案直接应用"
+        label = f"{name}，至少间隔 {self.tidy_hours()} 小时"
+        meta = self._tidy.meta(
+            tidy.scope_id("session", self._store.session_scope(umo).root.name)
+        )
+        if meta.pending:
+            return label + f"（本会话有 {meta.pending_count()} 项待确认）"
+        if meta.last_run:
+            when = time.strftime("%m-%d %H:%M", time.localtime(meta.last_run))
+            return label + f"（本会话上次 {when}：{meta.message}）"
+        return label
 
     def _recall_label(self) -> str:
         mode = self._str("recall_mode", "keyword").strip().lower()

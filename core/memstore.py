@@ -451,6 +451,55 @@ def _as_float(value: object) -> float:
         return 0.0
 
 
+# 原样导入时同名冲突的处理：留较新的 / 留现有的 / 用导入的覆盖
+CONFLICT_NEWER = "newer"
+CONFLICT_SKIP = "skip"
+CONFLICT_OVERWRITE = "overwrite"
+CONFLICT_POLICIES = (CONFLICT_NEWER, CONFLICT_SKIP, CONFLICT_OVERWRITE)
+# 每个导入文件的去向
+IMPORT_ADDED = "added"
+IMPORT_REPLACED = "replaced"
+IMPORT_SAME = "same"
+IMPORT_KEPT = "kept"
+IMPORT_INVALID = "invalid"
+
+
+@dataclass
+class ImportEntry:
+    """一个要原样落盘的记忆文件：迁移、备份恢复、撤销整理共用。"""
+
+    name: str
+    content: str
+    forgotten: bool = False
+    usage: Usage = field(default_factory=Usage)
+    # 原文件的写入时间；落盘后照设，没有 updated 戳的老文件时间也不变
+    mtime: float = 0.0
+
+
+@dataclass
+class ImportResult:
+    name: str
+    outcome: str
+    reason: str = ""
+
+    @property
+    def landed(self) -> bool:
+        """目标里现在有这份内容（新增、覆盖或本来就一样）。"""
+        return self.outcome in (IMPORT_ADDED, IMPORT_REPLACED, IMPORT_SAME)
+
+
+def _content_updated(content: str, fallback: float) -> float:
+    """冲突比较用的"最近修改"：updated 戳优先，没有就用文件写入时间。"""
+    return parse_stamp(parse_memory(content).updated) or fallback
+
+
+def _mtime_of(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
 @dataclass
 class IndexReport:
     """MEMORY.md 的健康状况：体积、是否截断、与实际文件是否对得上。"""
@@ -1048,6 +1097,193 @@ class ScopeStore:
                 folder.rmdir()
         except OSError:
             pass
+
+    # ------------------------------------------------------------ 原样导入导出
+
+    def snapshot(self, include_forgotten: bool = True) -> tuple[list[ImportEntry], str]:
+        """导出这个作用域：在册（与已遗忘）文件的原文、写入时间、使用统计，
+        以及索引原文（同步方法）。"""
+        usage = self.usage()
+        entries: list[ImportEntry] = []
+        sources = [(self.list_files(), False)]
+        if include_forgotten:
+            sources.append((self.forgotten_files(), True))
+        for names, forgotten in sources:
+            for name in names:
+                path = self._forgotten_path(name) if forgotten else self.root / name
+                try:
+                    content = path.read_text("utf-8")
+                    mtime = path.stat().st_mtime
+                except OSError:
+                    continue
+                entries.append(
+                    ImportEntry(
+                        name=name,
+                        content=content,
+                        forgotten=forgotten,
+                        usage=usage.get(name, Usage()),
+                        mtime=mtime,
+                    )
+                )
+        index_path = self.root / INDEX_FILENAME
+        try:
+            index = index_path.read_text("utf-8") if index_path.is_file() else ""
+        except OSError:
+            index = ""
+        return entries, index
+
+    async def import_files(
+        self,
+        entries: list[ImportEntry],
+        policy: str = CONFLICT_NEWER,
+        index: str = "",
+        dry_run: bool = False,
+    ) -> list[ImportResult]:
+        """原样落盘外来的记忆文件（迁移、恢复备份、撤销整理用）。
+
+        与 write() 不同，这里不补戳：created / updated / source 与使用统计
+        原样带过来，搬过去的老记忆不会看起来像刚写的。同名冲突按 policy
+        处理——newer 留 updated 较新的一份、skip 留现有的、overwrite 用导入的。
+        在册的同名文件总是优先于已遗忘的导入件。目标原本没有索引时先写入
+        带来的索引（保留分组与顺序），再按实际文件修正。
+        dry_run 只给出每个文件的去向，不落盘。
+        """
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._import_sync, entries, policy, index, dry_run
+            )
+
+    def _import_sync(
+        self,
+        entries: list[ImportEntry],
+        policy: str,
+        index: str,
+        dry_run: bool,
+    ) -> list[ImportResult]:
+        index_path = self.root / INDEX_FILENAME
+        adopt_index = bool(index.strip()) and not index_path.is_file()
+        results: list[ImportResult] = []
+        written: list[tuple[str, str]] = []
+        usage = self.usage() if not dry_run else {}
+        # 只回写这一批动到的条目，别把并发记下的使用统计盖掉
+        changes: dict[str, Usage] = {}
+        seen: set[str] = set()
+        for entry in entries:
+            name = (entry.name or "").strip()
+            outcome, reason = self._import_outcome(entry, name, policy, seen)
+            seen.add(name)
+            results.append(ImportResult(name, outcome, reason))
+            if dry_run or outcome in (IMPORT_KEPT, IMPORT_INVALID):
+                continue
+            incoming = Usage(
+                last_used=entry.usage.last_used,
+                uses=entry.usage.uses,
+                forgotten_at=(entry.usage.forgotten_at or entry.mtime or time.time())
+                if entry.forgotten
+                else 0.0,
+            )
+            if outcome == IMPORT_SAME:
+                current = usage.get(name, Usage())
+                merged = Usage(
+                    last_used=max(current.last_used, incoming.last_used),
+                    uses=max(current.uses, incoming.uses),
+                    forgotten_at=current.forgotten_at if entry.forgotten else 0.0,
+                )
+                if not entry.forgotten and self._forgotten_path(name).is_file():
+                    # 导入件在册而目标这份已遗忘：把它恢复在册
+                    self._write_file(self.root / name, entry.content, entry.mtime)
+                    self._discard_forgotten_file(name)
+                    self._drop_header(name)
+                    written.append((name, entry.content))
+                if merged != current:
+                    changes[name] = merged
+                continue
+            if outcome == IMPORT_REPLACED:
+                # 覆盖的是同一条记忆的另一个版本，两边用到过的次数都算数
+                current = usage.get(name, Usage())
+                incoming = Usage(
+                    last_used=max(current.last_used, incoming.last_used),
+                    uses=max(current.uses, incoming.uses),
+                    forgotten_at=incoming.forgotten_at,
+                )
+            if entry.forgotten:
+                self._write_file(self._forgotten_path(name), entry.content, entry.mtime)
+            else:
+                self._write_file(self.root / name, entry.content, entry.mtime)
+                self._discard_forgotten_file(name)
+                written.append((name, entry.content))
+            self._drop_header(name)
+            changes[name] = incoming
+        if dry_run:
+            return results
+        if changes:
+            with self._usage_lock:
+                current = self._load_usage()
+                current.update(changes)
+                self._save_usage(current)
+        if written:
+            if adopt_index:
+                self._write_atomic(index_path, index.strip("\n") + "\n")
+                self._rebuild_index_sync()
+            else:
+                for name, content in written:
+                    self._sync_index_line(name, parse_description(content)[0])
+        return results
+
+    def _import_outcome(
+        self, entry: ImportEntry, name: str, policy: str, seen: set[str]
+    ) -> tuple[str, str]:
+        if (
+            not self.is_valid_name(name)
+            or name.lower() == INDEX_FILENAME.lower()
+            or self._resolve(name) is None
+        ):
+            return IMPORT_INVALID, "文件名不合法"
+        if name in seen:
+            return IMPORT_INVALID, "同一批里重复出现"
+        if not entry.content.strip():
+            return IMPORT_INVALID, "内容为空"
+        if len(entry.content.encode("utf-8")) > MAX_FILE_BYTES:
+            return IMPORT_INVALID, f"超过单文件上限 {MAX_FILE_BYTES // 1024}KB"
+        active = self._read_if_exists(self.root / name)
+        dormant = self._read_if_exists(self._forgotten_path(name))
+        if entry.forgotten and active is not None:
+            # 目标这份正在用，已遗忘的导入件不去顶替它
+            if active == entry.content:
+                return IMPORT_SAME, ""
+            return IMPORT_KEPT, "目标里同名记忆在册，已遗忘的这份不导入"
+        current = active if active is not None else dormant
+        if current is None:
+            return IMPORT_ADDED, ""
+        if current == entry.content:
+            return IMPORT_SAME, ""
+        if policy == CONFLICT_OVERWRITE:
+            return IMPORT_REPLACED, ""
+        if policy == CONFLICT_NEWER:
+            path = self.root / name if active is not None else self._forgotten_path(name)
+            if _content_updated(entry.content, entry.mtime) > _content_updated(
+                current, _mtime_of(path)
+            ):
+                return IMPORT_REPLACED, ""
+            return IMPORT_KEPT, "目标里的同名记忆更新，保留现有"
+        return IMPORT_KEPT, "目标里已有同名记忆，保留现有"
+
+    def _write_file(self, path: Path, content: str, mtime: float = 0.0) -> None:
+        self._write_atomic(path, content)
+        if mtime > 0:
+            try:
+                os.utime(path, (mtime, mtime))
+            except OSError:
+                pass
+
+    def _discard_forgotten_file(self, name: str) -> None:
+        path = self._forgotten_path(name)
+        if path.is_file():
+            try:
+                path.unlink()
+            except OSError:
+                return
+            self._prune_forgotten_dir()
 
     def _drop_header(self, name: str) -> None:
         with self._headers_lock:

@@ -55,6 +55,7 @@ pkg_archive = importlib.import_module(f"{PACKAGE}.core.archive")
 pkg_compress = importlib.import_module(f"{PACKAGE}.core.compress")
 pkg_memstore = importlib.import_module(f"{PACKAGE}.core.memstore")
 pkg_registry = importlib.import_module(f"{PACKAGE}.core.registry")
+pkg_tidy = importlib.import_module(f"{PACKAGE}.core.tidy")
 
 UMO = "aiocqhttp:GroupMessage:100200"
 KEY = pkg_memstore.safe_key(UMO)
@@ -84,6 +85,7 @@ class FakePlugin:
         self._store = pkg_memstore.MemoryStore(base / "memories")
         self._registry = pkg_registry.SessionRegistry(base / "sessions.json")
         self._archive = pkg_archive.ArchiveStore(base / "archive")
+        self._tidy = pkg_tidy.TidyBook(base / "tidy")
         self._sessions: dict = {}
         self._state_dir = base / "state"
         self.config = {
@@ -109,6 +111,20 @@ class FakePlugin:
 
     def _bool(self, key, default):
         return self.config.get(key, default)
+
+    def tidy_mode(self):
+        return pkg_tidy.normalize_mode(self.config.get("auto_consolidate"))
+
+    def tidy_hours(self):
+        return pkg_tidy.clamp_hours(self.config.get("auto_consolidate_hours", 24))
+
+    async def save_tidy_settings(self, mode, hours):
+        self.config["auto_consolidate"] = mode
+        if hours is not None:
+            self.config["auto_consolidate_hours"] = hours
+
+    def platform_ids(self):
+        return ["aiocqhttp", "qq_new"]
 
     def runtime_for_key(self, key):
         for umo, rt in self._sessions.items():
@@ -201,7 +217,12 @@ def test_overview_merges_memory_dirs_and_registry(plugin, dash):
     plugin._registry.touch("tg_FriendMessage_42", "tg:FriendMessage:42", "小鱼")
     data = ok(call(dash, "overview"))
     assert data["memoryEnabled"] is True
-    assert data["global"] == {"fileCount": 0, "updatedAt": 0.0, "enabled": False}
+    assert data["global"] == {
+        "fileCount": 0,
+        "updatedAt": 0.0,
+        "enabled": False,
+        "tidyPending": 0,
+    }
     sessions = {s["key"]: s for s in data["sessions"]}
     assert sessions[KEY]["fileCount"] == 1
     assert sessions[KEY]["kind"] == "group"  # 没登记过的目录从目录名推断
@@ -453,13 +474,13 @@ def test_consolidate_errors(plugin, dash):
     assert "无法解析" in err(call(dash, "consolidate/preview", body=body))
     plugin.summarizer_reply = "<operations>[]</operations>"
     assert ok(call(dash, "consolidate/preview", body=body))["operations"] == []
-    assert dash._consolidating == set()  # 每次都释放了占用
+    assert plugin._tidy.busy == set()  # 每次都释放了占用
     assert "没有可应用" in err(call(dash, "consolidate/apply", body={**body, "operations": "x"}))
 
 
 def test_consolidate_busy_guard(plugin, dash):
     asyncio.run(session_store(plugin).write("a.md", memory("a", "d")))
-    dash._consolidating.add(f"session:{KEY}")
+    plugin._tidy.claim(f"session-{KEY}")
     assert "正在整理" in err(call(dash, "consolidate/preview", body={"scope": "session", "key": KEY}))
 
 
@@ -599,3 +620,169 @@ def test_forgotten_routes(plugin, dash):
     # 关闭开关：页面照样能看、能恢复，只是标成未启用
     plugin.config["enable_forgetting"] = False
     assert ok(call(dash, "scope", q))["forgettingEnabled"] is False
+
+
+# ---------------------------------------------------------------- 定期整理
+
+
+MERGE_REPLY = "<operations>" + json.dumps(
+    [
+        {"op": "write", "file": "user-1.md", "type": "user", "description": "阿杰（合并）", "content": "合并后正文", "reason": "合并"},
+        {"op": "delete", "file": "user-1-old.md", "reason": "已合并"},
+    ],
+    ensure_ascii=False,
+) + "</operations>"
+
+
+def test_autotidy_config_and_status(plugin, dash):
+    data = ok(call(dash, "overview"))
+    assert data["autoTidy"]["mode"] == "off" and data["autoTidy"]["asked"] is False
+    assert "只能是" in err(call(dash, "autotidy/config", body={"mode": "sometimes"}))
+
+    result = call(dash, "autotidy/config", body={"mode": "confirm", "hours": 0})
+    assert ok(result)["mode"] == "confirm" and ok(result)["hours"] == 1
+    assert "先问你" in result["message"]
+    assert plugin.config["auto_consolidate"] == "confirm"
+    assert plugin._tidy.settings()["asked"] is True
+
+    # 暂不开启：方式仍是关闭，但不再问
+    ok(call(dash, "autotidy/config", body={"mode": "off"}))
+    assert ok(call(dash, "overview"))["autoTidy"] == {
+        "mode": "off",
+        "hours": 1,
+        "asked": True,
+        "minChanges": pkg_tidy.MIN_CHANGES,
+    }
+
+
+def test_pending_plan_confirm_and_undo(plugin, dash):
+    store = session_store(plugin)
+    asyncio.run(store.write("user-1.md", memory("user-1", "阿杰")))
+    asyncio.run(store.write("user-1-old.md", memory("user-1-old", "阿杰旧档")))
+    before = asyncio.run(store.read("user-1.md"))
+    plugin.summarizer_reply = MERGE_REPLY
+    data = ok(call(dash, "consolidate/preview", body={"scope": "session", "key": KEY}))
+    sid = pkg_tidy.scope_id("session", KEY)
+
+    def leave_pending(meta):
+        meta.pending = {"createdAt": 1.0, "operations": data["operations"], "skipped": [], "files": data["files"]}
+
+    plugin._tidy.update_meta(sid, leave_pending)
+    overview = ok(call(dash, "overview"))
+    assert {s["key"]: s for s in overview["sessions"]}[KEY]["tidyPending"] == 2
+    status = ok(call(dash, "autotidy"))
+    assert status["pendingTotal"] == 1 and status["scopes"][0]["key"] == KEY
+    detail = ok(call(dash, "scope", {"scope": "session", "key": KEY}))
+    assert detail["tidy"]["pendingCount"] == 2
+    assert detail["tidy"]["plan"]["operations"] == data["operations"]
+
+    body = {"scope": "session", "key": KEY, "operations": data["operations"], "fromPending": True}
+    result = ok(call(dash, "consolidate/apply", body=body))
+    assert result["runId"] and store.list_files() == ["user-1.md"]
+    meta = plugin._tidy.meta(sid)
+    assert meta.pending is None and meta.last_run > 0 and meta.outcome == "applied"
+
+    runs = ok(call(dash, "tidy/runs", {"scope": "session", "key": KEY}))["runs"]
+    assert [r["trigger"] for r in runs] == ["confirmed"]
+    assert "before" not in json.dumps(runs)
+    undone = call(dash, "tidy/undo", body={"scope": "session", "key": KEY, "id": runs[0]["id"]})
+    assert ok(undone)["results"] and undone["message"] == "已撤销 2 / 2 项"
+    assert set(store.list_files()) == {"user-1.md", "user-1-old.md"}
+    assert asyncio.run(store.read("user-1.md")) == before
+    assert "撤销过" in err(call(dash, "tidy/undo", body={"scope": "session", "key": KEY, "id": runs[0]["id"]}))
+    assert "不存在" in err(call(dash, "tidy/undo", body={"scope": "session", "key": KEY, "id": "nope"}))
+
+
+def test_autotidy_dismiss_and_purge_clears(plugin, dash):
+    asyncio.run(session_store(plugin).write("a.md", memory("a", "d")))
+    sid = pkg_tidy.scope_id("session", KEY)
+    plugin._tidy.update_meta(sid, lambda meta: setattr(meta, "pending", {"operations": [{}]}))
+    ok(call(dash, "autotidy/dismiss", body={"scope": "session", "key": KEY}))
+    assert plugin._tidy.meta(sid).pending is None
+    plugin._tidy.add_run(sid, {"id": "1", "ops": []})
+    ok(call(dash, "session/purge", body={"key": KEY}))
+    assert plugin._tidy.runs(sid) == [] and plugin._tidy.all_meta() == {}
+
+
+# ---------------------------------------------------------------- 迁移与备份
+
+
+def test_export_then_import_elsewhere(plugin, dash, tmp_path):
+    asyncio.run(session_store(plugin).write("a.md", memory("a", "甲")))
+    plugin._registry.touch(KEY, UMO, "开黑群")
+    assert "没有可导出" in err(call(dash, "export/prepare", body={"scopes": [{"scope": "global"}]}))
+    prepared = ok(call(dash, "export/prepare", body={}))
+    assert prepared["fileCount"] == 1 and prepared["filename"].startswith("memory-backup-")
+    bundle = call(dash, "export/file", {"token": prepared["token"]})
+    assert bundle["format"] == "memory-beyond-backup"
+    assert "过期" in err(call(dash, "export/file", {"token": "bogus"}))
+
+    other = FakePlugin(tmp_path / "other")
+    other_dash = web_api.MemoryDashboard(other)
+    assert "不是记忆备份" in err(call(other_dash, "import/preview", body={"bundle": {"x": 1}}))
+    preview = ok(call(other_dash, "import/preview", body={"bundle": bundle}))
+    item = preview["scopes"][0]
+    assert item["name"] == "开黑群" and item["counts"]["added"] == 1
+    # 改冲突策略只传令牌
+    again = ok(call(other_dash, "import/preview", body={"token": preview["token"], "policy": "skip"}))
+    assert again["token"] == preview["token"]
+    assert "没有选中" in err(
+        call(other_dash, "import/apply", body={"token": preview["token"], "selection": []})
+    )
+    result = call(
+        other_dash,
+        "import/apply",
+        body={"token": preview["token"], "selection": [{"scope": "session", "key": KEY}]},
+    )
+    assert ok(result)["reports"][0]["counts"]["added"] == 1
+    assert "写入 1 条" in result["message"]
+    assert other._store.session_scope(UMO).list_files() == ["a.md"]
+    assert other._registry.get(KEY).name == "开黑群"
+    assert KEY in other.invalidated
+
+
+def test_migrate_scope_to_new_session(plugin, dash):
+    store = session_store(plugin)
+    asyncio.run(store.write("a.md", memory("a", "甲")))
+    asyncio.run(store.write("b.md", memory("b", "乙")))
+    new_umo = "aiocqhttp:GroupMessage:300400"
+    new_key = pkg_memstore.safe_key(new_umo)
+    body = {
+        "from": {"scope": "session", "key": KEY},
+        "to": {"umo": new_umo},
+        "files": ["a.md"],
+        "mode": "move",
+    }
+    assert "格式" in err(call(dash, "migrate/scope", body={**body, "to": {"umo": "abc"}}))
+    preview = ok(call(dash, "migrate/scope", body={**body, "dryRun": True}))
+    assert preview["counts"]["added"] == 1 and preview["to"]["key"] == new_key
+    assert store.list_files() == ["a.md", "b.md"]
+    result = call(dash, "migrate/scope", body=body)
+    assert "移走 1 条" in result["message"]
+    assert store.list_files() == ["b.md"]
+    assert plugin._store.session_scope(new_umo).list_files() == ["a.md"]
+    assert plugin._registry.get(new_key).umo == new_umo
+    assert {KEY, new_key} <= set(plugin.invalidated)
+    # 搬进还没有人物记忆的平台
+    plugin.config["enable_people_memory"] = True
+    asyncio.run(store.write("user-9.md", memory("user-9", "小九")))
+    people = {"scope": "people", "platform": "qq_new"}
+    ok(call(dash, "migrate/scope", body={"from": {"scope": "session", "key": KEY}, "to": people, "files": ["user-9.md"]}))
+    assert plugin._store.people_scope("qq_new").list_files() == ["user-9.md"]
+
+
+def test_migrate_platform_and_info(plugin, dash):
+    asyncio.run(session_store(plugin).write("a.md", memory("a", "甲")))
+    plugin._registry.touch(KEY, UMO, "开黑群")
+    info = ok(call(dash, "migrate/info"))
+    assert info["platforms"] == [{"platform": "aiocqhttp", "sessions": 1, "people": False}]
+    assert info["adapters"] == ["aiocqhttp", "qq_new"]
+    body = {"from": "aiocqhttp", "to": "qq_new"}
+    preview = ok(call(dash, "migrate/platform", body={**body, "dryRun": True}))
+    assert preview["totals"]["added"] == 1
+    result = call(dash, "migrate/platform", body=body)
+    assert "写入 1 条" in result["message"]
+    new_key = pkg_memstore.safe_key("qq_new:GroupMessage:100200")
+    assert plugin._store.session_scope_by_key(new_key).list_files() == ["a.md"]
+    assert plugin._registry.get(KEY) is None
+    assert "相同" in err(call(dash, "migrate/platform", body={"from": "x", "to": "x"}))

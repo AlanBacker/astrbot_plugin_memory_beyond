@@ -60,6 +60,17 @@ def guess_from_key(key: str) -> tuple[str, str, str]:
     )
 
 
+def umo_from_key(key: str) -> str:
+    """从目录名拼回 UMO 的候选；不符合固定格式返回空串。
+
+    目录名转换时被替换掉的字符还原不回来，调用方要再用 safe_key 核对一遍。
+    """
+    match = _LEGACY_KEY_RE.match(key or "")
+    if not match:
+        return ""
+    return ":".join(match.group("platform", "type", "target"))
+
+
 def _clip(value) -> str:
     return " ".join(str(value or "").split())[:MAX_TEXT]
 
@@ -186,6 +197,50 @@ class SessionRegistry:
                 )
                 records[key] = record
             record.remark = _clip(remark)
+            self._dirty = True
+            self.flush()
+            return record
+
+    def adopt(
+        self,
+        key: str,
+        umo: str = "",
+        *,
+        name: str = "",
+        remark: str = "",
+        first_seen: float = 0.0,
+        last_active: float = 0.0,
+    ) -> SessionRecord:
+        """登记迁入的会话（导入备份、会话之间搬记忆时用），不算一次活跃。
+
+        已有记录只补空缺：来源、群名、备注原本为空才填，首次出现取更早的，
+        最近活跃取更晚的。立即落盘。
+        """
+        with self._lock:
+            records = self._load()
+            record = records.get(key)
+            if record is None:
+                if umo:
+                    platform, kind, target = parse_umo(umo)
+                else:
+                    platform, kind, target = guess_from_key(key)
+                record = SessionRecord(
+                    key=key, umo=umo, platform=platform, kind=kind, target=target
+                )
+                records[key] = record
+            elif umo and not record.umo:
+                record.umo = umo
+                record.platform, record.kind, record.target = parse_umo(umo)
+            if name and not record.name:
+                record.name = _clip(name)
+            if remark and not record.remark:
+                record.remark = _clip(remark)
+            if first_seen > 0 and (
+                not record.first_seen or first_seen < record.first_seen
+            ):
+                record.first_seen = first_seen
+            if last_active > record.last_active:
+                record.last_active = last_active
             self._dirty = True
             self.flush()
             return record
