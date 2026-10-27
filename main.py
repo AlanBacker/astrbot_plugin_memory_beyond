@@ -6,13 +6,15 @@
     main.py     —— 平台适配层（本文件）：钩子、LLM 工具、指令、provider 调用
     web_api.py  —— WebUI 记忆管理页的后端接口（页面在 pages/memory）
     core/       —— 纯逻辑：记忆库、索引、召回、token 估算、轮次切分、
-                   压缩状态机、会话登记、压缩归档、记忆整理
+                   压缩状态机、会话登记、压缩归档、记忆整理、工具循环保护
 
 兼容性立场：只依赖 @filter.on_llm_request() / @filter.on_llm_response() /
 @filter.llm_tool() 等公开插件接口，不 import AstrBot 内部实现、不 monkey-patch。
 压缩采用抢先策略：在钩子里把 req.contexts 压到低于内置压缩器 0.82 的阈值，
-内置压缩器的 should_compress() 因此永远为 False、自动退化为 no-op，
-同时留在下游当安全网。AstrBot 每轮会把实际发送的消息列表回存为会话历史，
+这一轮开头内置压缩器无事可做，同时留在下游当安全网。但模型一次回复里可以连续
+调用很多轮工具，结果一轮轮涨进上下文，开头的判断管不到，所以另在每个工具返回
+之后盯一次（core/loopguard.py）：快越过阈值就把较早的工具结果换成占位说明。
+AstrBot 每轮会把实际发送的消息列表回存为会话历史，
 因此注入块一律带 _no_save 声明不入史；压缩后被摘要覆盖的原文会随回存从
 平台历史卸下，由持久化的摘要继续代表（详见 core/compress.py 模块注释）。
 """
@@ -32,7 +34,17 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star, StarTools
 
-from .core import archive, compress, memstore, prompts, recall, registry, tidy, tokens
+from .core import (
+    archive,
+    compress,
+    loopguard,
+    memstore,
+    prompts,
+    recall,
+    registry,
+    tidy,
+    tokens,
+)
 from .core.turns import split_leading_system, split_turns
 from .web_api import MemoryDashboard
 
@@ -60,6 +72,24 @@ RECALL_SELECT_TIMEOUT = 15
 # 遗忘扫描：每个作用域目录至多每隔这么久扫一次（秒）；默认多久没用到算遗忘（天）
 FORGET_SWEEP_INTERVAL = 6 * 3600
 FORGET_DEFAULT_DAYS = 90
+# 工具循环守卫在事件额外字段里的键（on_llm_request 建好，工具钩子取用）
+LOOP_GUARD_KEY = "memory_beyond_loop_guard"
+
+
+def _hook_or_noop(name: str):
+    """取一个较新才有的钩子装饰器；旧版 AstrBot 没有时退化为空装饰器，
+    插件照常加载，只是对应功能不生效。"""
+    hook = getattr(filter, name, None)
+    if hook is not None:
+        return hook
+    return lambda *args, **kwargs: (lambda func: func)
+
+
+_on_agent_begin = _hook_or_noop("on_agent_begin")
+_on_tool_respond = _hook_or_noop("on_llm_tool_respond")
+LOOP_HOOKS_READY = all(
+    hasattr(filter, name) for name in ("on_agent_begin", "on_llm_tool_respond")
+)
 
 # 自动探测模型上下文窗口的对照表：子串匹配，先命中先用。
 # 探测只是兜底，README 中明确建议手动配置 max_context_tokens。
@@ -131,6 +161,8 @@ class RuntimeSession:
     warned_clip: bool = False
     # 后台提取进行中（同一会话不并发提取）
     extracting: bool = False
+    # 工具循环中途累计清理的工具结果条数（仅内存，供 mb_status 展示）
+    loop_cleared: int = 0
 
 
 class MemoryBeyondPlugin(Star):
@@ -165,6 +197,12 @@ class MemoryBeyondPlugin(Star):
             LOG_PREFIX
             + f"已加载：压缩阈值 {threshold}，数据目录 {data_dir}"
         )
+        if self._bool("loop_guard", True) and not LOOP_HOOKS_READY:
+            logger.warning(
+                LOG_PREFIX
+                + "当前 AstrBot 缺少 on_agent_begin / on_llm_tool_respond 钩子，"
+                "工具循环中途保护不生效（升级 AstrBot 后恢复）"
+            )
 
     @staticmethod
     def _resolve_data_dir() -> Path:
@@ -498,7 +536,9 @@ class MemoryBeyondPlugin(Star):
     async def inject_and_compress(
         self, event: AstrMessageEvent, req: ProviderRequest
     ):
-        """唯一介入点：注入记忆索引、必要时抢先压缩，拼出本轮发送视图。"""
+        """请求前的介入点：注入记忆索引、必要时抢先压缩，拼出本轮发送视图。"""
+        # 同一事件里上一次请求遗留的循环守卫不能带进这一次
+        self._arm_loop_guard(event, None)
         try:
             await self._process_request(event, req)
         except Exception:  # noqa: BLE001 - 插件缺陷不能拖垮 LLM 请求链路
@@ -683,6 +723,19 @@ class MemoryBeyondPlugin(Star):
                 else:
                     rt.warned_clip = True
                     logger.warning(message)
+            # 上面只管这条消息开头；工具循环里结果还会一轮轮涨进上下文，
+            # 交给循环守卫在每个工具返回后盯着（预算与上面的压缩同一套）
+            if self._bool("loop_guard", True) and LOOP_HOOKS_READY:
+                self._arm_loop_guard(
+                    event,
+                    loopguard.LoopGuard.for_window(
+                        window,
+                        threshold=self._threshold(),
+                        target_ratio=self._target_ratio(),
+                        tools_cost=tools_cost,
+                        ratio=estimator.ratio,
+                    ),
+                )
         if cleared_total:
             logger.info(
                 LOG_PREFIX
@@ -1557,6 +1610,99 @@ class MemoryBeyondPlugin(Star):
         except Exception:  # noqa: BLE001
             logger.debug(LOG_PREFIX + "token 校准失败", exc_info=True)
 
+    # ====================================================== 工具循环中途保护
+
+    @staticmethod
+    def _arm_loop_guard(event: AstrMessageEvent, guard) -> None:
+        """把守卫（或 None）挂到事件上；事件对象不支持额外字段时放弃，不影响请求。"""
+        try:
+            event.set_extra(LOOP_GUARD_KEY, guard)
+        except Exception:  # noqa: BLE001
+            pass
+
+    @staticmethod
+    def _loop_guard(event: AstrMessageEvent) -> loopguard.LoopGuard | None:
+        try:
+            guard = event.get_extra(LOOP_GUARD_KEY)
+        except Exception:  # noqa: BLE001
+            return None
+        return guard if isinstance(guard, loopguard.LoopGuard) else None
+
+    @_on_agent_begin()
+    async def loop_guard_begin(self, event: AstrMessageEvent, run_context=None):
+        """Agent 开始运行：把运行上下文交给本轮的守卫——工具钩子里拿不到消息列表，
+        要靠它就地读写。"""
+        guard = self._loop_guard(event)
+        if guard is not None:
+            guard.run_context = run_context
+
+    @_on_tool_respond()
+    async def loop_guard_observe(
+        self,
+        event: AstrMessageEvent,
+        tool=None,
+        tool_args=None,
+        tool_result=None,
+    ):
+        """每个工具返回之后估算下一次请求的大小，快越过压缩阈值就清理较早的
+        工具结果。出任何错都只放弃本轮的保护，绝不能打断用户的工具循环。"""
+        guard = self._loop_guard(event)
+        if guard is None or guard.run_context is None:
+            return
+        umo = str(getattr(event, "unified_msg_origin", "") or "")
+        try:
+            text, images = loopguard.describe_result(tool_result)
+            outcome = guard.after_tool(
+                getattr(guard.run_context, "messages", None),
+                name=str(getattr(tool, "name", "") or ""),
+                args=tool_args,
+                result_text=text,
+                images=images,
+            )
+            if outcome is None:
+                return
+            if outcome.cleared:
+                rt = self._sessions.get(umo)
+                if rt is not None:
+                    rt.loop_cleared += outcome.cleared
+                logger.info(
+                    LOG_PREFIX
+                    + f"会话 {umo} 工具循环中途，下一次请求估算约 {outcome.before} "
+                    f"tokens，越过触发线 {guard.limit}；清理了 {outcome.cleared} 条"
+                    f"较早的工具结果，降到约 {outcome.after}"
+                )
+            # 两种「救不了」的情况每轮回复只告警一次（stuck 由守卫收口）；
+            # 同一批里后续工具再撞上，只记 debug，免得并行多个工具时刷屏
+            if outcome.futile and not outcome.stuck:
+                logger.debug(
+                    LOG_PREFIX
+                    + f"会话 {umo} 工具循环中途仍是徒劳：估算约 {outcome.before} "
+                    f"tokens，超出窗口 {guard.ceiling}，未动较早的工具结果"
+                )
+            elif outcome.futile:
+                logger.warning(
+                    LOG_PREFIX
+                    + f"会话 {umo} 工具循环中途，下一次请求估算约 {outcome.before} "
+                    f"tokens，即使清掉所有较早的工具结果也超出窗口 {guard.ceiling}，"
+                    "所以没有动它们。多半是某个工具一次返回的内容过大（AstrBot 把它"
+                    "落盘成预览的话则无妨）；否则请让工具返回更精简的内容，"
+                    "或调大 max_context_tokens"
+                )
+            elif outcome.stuck:
+                logger.warning(
+                    LOG_PREFIX
+                    + f"会话 {umo} 工具循环中途估算约 {outcome.after} tokens，仍高于"
+                    f"触发线 {guard.limit}，但已没有可清理的较早工具结果。再涨下去"
+                    "可能超出模型窗口，或触发平台内置压缩（会成段丢掉较早的消息）；"
+                    "单次工具返回过大时，请让工具返回更精简的内容，或调大 "
+                    "max_context_tokens"
+                )
+        except Exception:  # noqa: BLE001
+            guard.run_context = None  # 本轮不再介入
+            logger.warning(
+                LOG_PREFIX + "工具循环中途保护出错，本轮不再介入", exc_info=True
+            )
+
     # ============================================================ 记忆工具
 
     @filter.llm_tool(name="memory_read")
@@ -1921,6 +2067,7 @@ class MemoryBeyondPlugin(Star):
             f"压缩：{'启用' if self._bool('enable_compression', True) else '停用'}",
             f"上下文窗口：{window if window > 0 else '未知'}（{window_note}）",
             f"触发阈值：{self._threshold():g}，压缩目标：{self._target_ratio():g}",
+            f"工具循环中途保护：{self._loop_guard_label(rt)}",
             f"水位线：{state.watermark}，摘要：{len(state.summary)} 字",
             *estimate_lines,
             "最近一次缓存命中："
@@ -1939,6 +2086,15 @@ class MemoryBeyondPlugin(Star):
             "记忆管理页：AstrBot WebUI 侧边栏「插件页面」",
         ]
         yield event.plain_result("\n".join(lines))
+
+    def _loop_guard_label(self, rt: RuntimeSession) -> str:
+        if not self._bool("loop_guard", True):
+            return "关闭"
+        if not LOOP_HOOKS_READY:
+            return "不可用（当前 AstrBot 缺少所需钩子）"
+        if not self._bool("enable_compression", True):
+            return "未生效（压缩已停用）"
+        return f"开启（本次运行以来本会话共清理过 {rt.loop_cleared} 条工具结果）"
 
     def _forget_label(self, umo: str) -> str:
         if not self._forgetting_on():

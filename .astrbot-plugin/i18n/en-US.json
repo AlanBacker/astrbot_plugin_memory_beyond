@@ -109,7 +109,11 @@
     },
     "tool_result_idle_minutes": {
       "description": "Clear old tool results after idle (minutes)",
-      "hint": "After a chat has been idle this long, the provider's prompt cache has expired and the whole context will be billed again anyway, so long tool results in older turns are replaced with a short placeholder to save tokens. The most recent turns (same as \"Recent turns kept in full\") and the platform's chat history are not affected. Default 60; 0 turns it off."
+      "hint": "After a chat has been idle this long, the provider's prompt cache has expired and the whole context will be billed again anyway, so long tool results in older turns are replaced with a short placeholder to save tokens. The most recent turns (same as \"Recent turns kept in full\") are not affected. The placeholder is saved into the bot's own conversation history along with the rest of the turn (your messages in the chat app are not affected). Default 60; 0 turns it off."
+    },
+    "loop_guard": {
+      "description": "Keep long tool loops from overflowing the context",
+      "hint": "When the model calls many tools in a single reply (searching, reading files, and so on), the results pile up in the context one by one, and compressing at the start of the message cannot stop it from outgrowing the window midway. When on, after each tool returns the plugin estimates how large the next request will be, and if it is about to cross the compression threshold, older tool results are replaced with a short placeholder so the reply can finish. The two most recent rounds are left alone where possible, and tool calls stay paired with their results. The placeholder is saved into the bot's own conversation history (your messages in the chat app are not affected), and the provider's prompt cache is invalidated once at that step. It only applies when context compression is on and the window size is known. Default on."
     },
     "archive_keep": {
       "description": "Compression archives kept per chat",

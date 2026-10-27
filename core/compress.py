@@ -31,8 +31,9 @@ from dataclasses import dataclass, field
 from . import tokens
 from .turns import Turn, is_internal_message, split_leading_system, split_turns
 
-# 内置压缩器阈值。本插件阈值必须低于它，内置压缩器的 should_compress()
-# 才会永远返回 False、自动退化为 no-op（同时留在下游当安全网）。
+# 内置压缩器阈值。本插件阈值必须低于它，每条消息开头才总是我们抢先一步、
+# 内置压缩器无事可做（同时留在下游当安全网）。工具循环中途上下文的增长
+# 不在这条线的保证之内，由 loopguard 另行拦着。
 BUILTIN_THRESHOLD = 0.82
 # 阈值配置非法（>= 0.82 或 <= 0）时回退到的安全值。
 THRESHOLD_FALLBACK = 0.70
@@ -261,8 +262,8 @@ def reconcile(state: SessionState, cid: str, contexts: list[dict]) -> str:
 def validate_threshold(raw: float) -> tuple[float, str]:
     """校验触发阈值必须落在 (0, 0.82) 内，否则回退并给出告警文案。
 
-    这是整套抢先压缩方案唯一的失效条件：阈值不低于内置压缩器的 0.82，
-    内置压缩器会抢先触发、自研压缩形同虚设，必须硬性拦住。
+    抢先压缩成立的前提：阈值不低于内置压缩器的 0.82，内置压缩器就会抢先触发、
+    自研压缩形同虚设，必须硬性拦住。
     """
     try:
         value = float(raw)
