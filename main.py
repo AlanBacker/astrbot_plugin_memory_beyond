@@ -6,7 +6,8 @@
     main.py     —— 平台适配层（本文件）：钩子、LLM 工具、指令、provider 调用
     web_api.py  —— WebUI 记忆管理页的后端接口（页面在 pages/memory）
     core/       —— 纯逻辑：记忆库、索引、召回、token 估算、轮次切分、
-                   压缩状态机、会话登记、压缩归档、记忆整理、工具循环保护
+                   压缩状态机、会话登记、压缩归档、记忆整理、工具循环保护、
+                   较早轮次瘦身
 
 兼容性立场：只依赖 @filter.on_llm_request() / @filter.on_llm_response() /
 @filter.llm_tool() 等公开插件接口，不 import AstrBot 内部实现、不 monkey-patch。
@@ -24,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import re
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -42,6 +44,7 @@ from .core import (
     prompts,
     recall,
     registry,
+    slim,
     tidy,
     tokens,
 )
@@ -203,6 +206,19 @@ class MemoryBeyondPlugin(Star):
                 + "当前 AstrBot 缺少 on_agent_begin / on_llm_tool_respond 钩子，"
                 "工具循环中途保护不生效（升级 AstrBot 后恢复）"
             )
+        # 较早轮次瘦身的前缀正则：保存配置会重载插件，在这里编译一次即可；
+        # 留空或写错时为 None，按当前「提示词前缀」的原文去匹配
+        self._slim_prefix_rx = None
+        pattern = self._str("slim_prefix_pattern")
+        if pattern:
+            try:
+                self._slim_prefix_rx = re.compile(pattern, re.DOTALL)
+            except re.error as exc:
+                logger.warning(
+                    LOG_PREFIX
+                    + f"slim_prefix_pattern 不是合法的正则（{exc}），"
+                    "改为按当前提示词前缀的原文匹配"
+                )
 
     @staticmethod
     def _resolve_data_dir() -> Path:
@@ -567,6 +583,25 @@ class MemoryBeyondPlugin(Star):
             for m in (req.contexts or [])
             if isinstance(m, dict) and not prompts.is_index_block(m)
         ]
+
+        # ---- 较早轮次瘦身：去掉每轮重复的前缀与系统提醒，旧搜索结果换成一句话 ----
+        # 放在压缩校验之前，估算、压缩、摘要看到的都是瘦过的历史；
+        # 瘦过的内容随回存入史，之后每轮只改到刚结束的那一轮
+        if self._bool("slim_history", False):
+            prefix_rx = self._slim_prefix_rx
+            if prefix_rx is None:
+                prefix = (
+                    self.context.get_config(umo=umo)
+                    .get("provider_settings", {})
+                    .get("prompt_prefix")
+                )
+                head = str(prefix or "").split("{{prompt}}")[0]
+                prefix_rx = re.compile(re.escape(head)) if head.strip() else None
+            contexts, saved = slim.slim_history(
+                contexts, prefix_rx, list(self.config.get("slim_tools") or [])
+            )
+            if saved:
+                logger.debug(LOG_PREFIX + f"会话 {umo} 较早轮次瘦身省下 {saved} 字")
 
         # ---- 消费上一轮的用量校准样本 ----
         # 估算只覆盖一轮的首次调用，而 usage 来自最后一次调用：上一轮若走
