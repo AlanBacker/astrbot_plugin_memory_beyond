@@ -8,6 +8,10 @@ AstrBot 把「提示词前缀」拼进每条用户消息、把 <system_reminder>
 平台每轮回存实际发送的消息列表，瘦过的轮次之后读进来已经是瘦的，再处理一遍
 不会变（幂等）：每次请求只改到刚结束的那一轮，更早的前缀与上次完全一样，
 提示词缓存照常命中。
+
+另有短回复连发检测（short_reply_streak）：模型会照着自己刚说过的话往下接，
+一连几条只有几个字的回复进了历史，之后就越回越短、越回越冲；检测到这种
+情况时由调用方给本轮附一句 SHORT_STREAK_NOTE。
 """
 
 from __future__ import annotations
@@ -21,6 +25,15 @@ GROUP_CONTEXT_START = "You are in a group chat."
 # 旧提醒只留这一行，模型仍能知道每句话是什么时候说的
 KEPT_REMINDER_LINE = "Current datetime:"
 TOOL_RESULT_PLACEHOLDER = "[旧搜索结果已省略，结论见你当时的回复；需要细节就重新搜]"
+# 短回复连发：最近这么多条回复都不超过这么多字（表情包标签不算）就算连发
+SHORT_STREAK_REPLIES = 3
+SHORT_STREAK_MAX_CHARS = 6
+MEME_TAG = re.compile(r"&&.*?&&")
+# 写成不带时间行的系统提醒：开着瘦身时，下一轮就从历史里整块去掉，不会越攒越多
+SHORT_STREAK_NOTE = (
+    "<system_reminder>你最近几条回复都只有几个字。这条按你平时的样子好好回，"
+    "语气别冲，也别敷衍。</system_reminder>"
+)
 
 
 def _keep_datetime(match: re.Match) -> str:
@@ -118,3 +131,46 @@ def slim_history(
                 changed = True
         slimmed.append(message)
     return (slimmed, saved) if changed else (contexts, 0)
+
+
+def short_reply_streak(contexts: list[dict]) -> bool:
+    """最近几条机器人回复是不是都只有几个字。
+
+    只看纯文字回复：带工具调用的助手消息、没有文字的回复跳过，表情包标签
+    （&&…&&）不计字数。
+
+    Args:
+        contexts: 会话历史（不含本轮新消息）。
+
+    Returns:
+        最近 SHORT_STREAK_REPLIES 条回复都不超过 SHORT_STREAK_MAX_CHARS 字时为 True；
+        回复不够这么多条时为 False。
+    """
+    seen = 0
+    for message in reversed(contexts):
+        if (
+            not isinstance(message, dict)
+            or message.get("role") != "assistant"
+            or message.get("tool_calls")
+        ):
+            continue
+        content = message.get("content")
+        parts = (
+            content
+            if isinstance(content, list)
+            else [{"type": "text", "text": content or ""}]
+        )
+        text = "".join(
+            part.get("text") or ""
+            for part in parts
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
+        text = MEME_TAG.sub("", text).strip()
+        if not text:
+            continue
+        if len(text) > SHORT_STREAK_MAX_CHARS:
+            return False
+        seen += 1
+        if seen == SHORT_STREAK_REPLIES:
+            return True
+    return False

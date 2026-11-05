@@ -115,3 +115,35 @@ def test_literal_prefix_from_current_config():
     history = [{"role": "user", "content": f"{PREFIX}在吗"}]
     slimmed, _ = slim_history(history, rx, [])
     assert slimmed[0]["content"] == "在吗"
+
+
+def _reply(text) -> dict:
+    return {"role": "assistant", "content": text}
+
+
+def test_short_reply_streak_needs_three_short_replies_in_a_row():
+    from core.slim import short_reply_streak
+
+    asked = {"role": "user", "content": "在吗"}
+    assert short_reply_streak([asked, _reply("哪有"), asked, _reply("爬"), asked, _reply("少来这套")])
+    assert not short_reply_streak([asked, _reply("哪有"), asked, _reply("爬")])
+    # 最近一条长回复打断连发
+    assert not short_reply_streak(
+        [_reply("哪有"), _reply("爬"), _reply("少来这套"), _reply("行，那你待会儿整个粗犷大汉音给群友来点震撼")]
+    )
+    # 更早的长回复不影响
+    assert short_reply_streak([_reply("很长的一段回复" * 5), _reply("哪有"), _reply("爬"), _reply("叫谁呢")])
+
+
+def test_short_reply_streak_skips_tool_calls_empty_replies_and_meme_tags():
+    from core.slim import short_reply_streak
+
+    history = [
+        _reply("笑屁呢"),
+        *_search_round("c1", "web_search_bocha", "结果"),
+        _reply([{"type": "think", "think": "想了很久很久很久很久"}, {"type": "text", "text": "少来这套&&baka&&"}]),
+        _reply(""),
+        _reply([{"type": "text", "text": "  爬  "}]),
+    ]
+    assert short_reply_streak(history)
+    assert not short_reply_streak([_reply("早啊"), _reply("牛来")])

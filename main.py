@@ -603,6 +603,22 @@ class MemoryBeyondPlugin(Star):
             if saved:
                 logger.debug(LOG_PREFIX + f"会话 {umo} 较早轮次瘦身省下 {saved} 字")
 
+        # ---- 短回复连发提醒：模型会照着自己刚说过的话往下接 ----
+        # 一连几条只有几个字的回复（多半带刺）进了历史，之后越回越短、越回越冲；
+        # 这时给本轮新消息附一句提醒。提醒不带时间行，开着瘦身时下一轮就被清掉
+        extra_parts = getattr(req, "extra_user_content_parts", None)
+        if (
+            self._bool("streak_guard", False)
+            and extra_parts is not None
+            and slim.short_reply_streak(contexts)
+        ):
+            from astrbot.core.agent.message import TextPart
+
+            extra_parts.append(TextPart(text=slim.SHORT_STREAK_NOTE))
+            logger.info(
+                LOG_PREFIX + f"会话 {umo} 最近几条回复都只有几个字，本轮附上回到平时口气的提醒"
+            )
+
         # ---- 消费上一轮的用量校准样本 ----
         # 估算只覆盖一轮的首次调用，而 usage 来自最后一次调用：上一轮若走
         # 了工具循环，最后一次调用会多出中途塞入的工具结果，这种样本会把
