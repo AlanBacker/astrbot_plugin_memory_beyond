@@ -147,3 +147,55 @@ def test_short_reply_streak_skips_tool_calls_empty_replies_and_meme_tags():
     ]
     assert short_reply_streak(history)
     assert not short_reply_streak([_reply("早啊"), _reply("牛来")])
+
+
+class Reply:
+    def __init__(self, sender_id):
+        self.sender_id = sender_id
+
+
+class Plain:
+    def __init__(self, text):
+        self.text = text
+
+
+class At:
+    def __init__(self, qq):
+        self.qq = qq
+
+
+def test_quoted_pushback_needs_a_quote_of_the_bot_and_a_bare_question_or_denial():
+    from core.slim import quoted_pushback
+
+    bot = "551089717"
+    assert quoted_pushback([Reply(551089717), Plain("？")], bot)
+    assert quoted_pushback([Reply(bot), At(bot), Plain(" 并非 ")], bot)
+    assert quoted_pushback([Reply(bot), Plain("嗯？？？？？")], bot)
+    assert quoted_pushback([Reply(bot), Plain("你记错了")], bot)
+    # 引用的是别人，或者正文不只是问号/否认
+    assert not quoted_pushback([Reply("1527600428"), Plain("？")], bot)
+    assert not quoted_pushback([Reply(bot), Plain("摸摸哈基米")], bot)
+    assert not quoted_pushback([Reply(bot), Plain("不是，我说的是另一个")], bot)
+    assert not quoted_pushback([Reply(bot), Plain("嗯")], bot)
+    # 没引用、或者不知道机器人自己的 ID
+    assert not quoted_pushback([Plain("？")], bot)
+    assert not quoted_pushback([Reply(bot), Plain("？")], "")
+
+
+def test_pushback_note_is_dropped_from_history_next_turn():
+    from core.slim import PUSHBACK_NOTE
+
+    history = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": f"{PREFIX}？<Quoted Message>\n(小咖): 那是\n</Quoted Message>"},
+                {"type": "text", "text": REMINDER},
+                {"type": "text", "text": PUSHBACK_NOTE},
+            ],
+        }
+    ]
+    slimmed, _ = slim_history(history, PREFIX_RX, [])
+    texts = [p["text"] for p in slimmed[0]["content"]]
+    assert all(PUSHBACK_NOTE not in t for t in texts)
+    assert any("Current datetime" in t for t in texts)

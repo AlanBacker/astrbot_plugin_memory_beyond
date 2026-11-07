@@ -619,6 +619,22 @@ class MemoryBeyondPlugin(Star):
                 LOG_PREFIX + f"会话 {umo} 最近几条回复都只有几个字，本轮附上回到平时口气的提醒"
             )
 
+        # ---- 被引用质疑提醒：引用机器人那条、只回问号或一句"并非" ----
+        # 模型常搬出记忆嘴硬、反呛对方，几个来回就吵起来；同样附一句不带时间行的提醒
+        if self._bool("pushback_guard", False) and extra_parts is not None:
+            try:
+                self_id = str(event.get_self_id() or "")
+                segments = list(event.get_messages() or [])
+            except Exception:  # noqa: BLE001
+                self_id, segments = "", []
+            if slim.quoted_pushback(segments, self_id):
+                from astrbot.core.agent.message import TextPart
+
+                extra_parts.append(TextPart(text=slim.PUSHBACK_NOTE))
+                logger.info(
+                    LOG_PREFIX + f"会话 {umo} 有人引用机器人的话回了问号或否认，本轮附上别嘴硬的提醒"
+                )
+
         # ---- 消费上一轮的用量校准样本 ----
         # 估算只覆盖一轮的首次调用，而 usage 来自最后一次调用：上一轮若走
         # 了工具循环，最后一次调用会多出中途塞入的工具结果，这种样本会把
