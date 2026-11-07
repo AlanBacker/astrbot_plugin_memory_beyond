@@ -12,9 +12,6 @@ AstrBot 把「提示词前缀」拼进每条用户消息、把 <system_reminder>
 另有短回复连发检测（short_reply_streak）：模型会照着自己刚说过的话往下接，
 一连几条只有几个字的回复进了历史，之后就越回越短、越回越冲；检测到这种
 情况时由调用方给本轮附一句 SHORT_STREAK_NOTE。
-
-被引用质疑检测（quoted_pushback）：有人引用机器人自己那条、只回个问号或一句
-"并非"，模型常搬出记忆嘴硬、反呛对方，几个来回就吵起来；这时附一句 PUSHBACK_NOTE。
 """
 
 from __future__ import annotations
@@ -36,16 +33,6 @@ MEME_TAG = re.compile(r"&&.*?&&")
 SHORT_STREAK_NOTE = (
     "<system_reminder>你最近几条回复都只有几个字。这条按你平时的样子好好回，"
     "语气别冲，也别敷衍。</system_reminder>"
-)
-# 被引用质疑：引用机器人自己那条、正文只有问号或一句短否认
-PUSHBACK_TEXT = re.compile(
-    r"[?？¿]+|(?:嗯|啊|啥|什么|蛤)[?？¿]+"
-    r"|(?:并非|不是|不对|没有|才没有|才不是|哪有|瞎说|胡说|乱说|你?记错了)[?？¿!！。.…]*"
-)
-PUSHBACK_NOTE = (
-    "<system_reminder>对方引用了你刚才那条，只回了个问号或者一句否认，多半是觉得你说得不对或者没看懂。"
-    "说的是他本人的事就以他说的为准，顺着改口；没头没脑的就解释一句或者问他指啥。"
-    "别嘴硬，别翻旧账，别呛人。</system_reminder>"
 )
 
 
@@ -187,32 +174,3 @@ def short_reply_streak(contexts: list[dict]) -> bool:
         if seen == SHORT_STREAK_REPLIES:
             return True
     return False
-
-
-def quoted_pushback(segments: list, self_id: str) -> bool:
-    """本条消息是不是引用了机器人自己的话、正文只回了问号或一句短否认。
-
-    模型手里有记忆和自己刚说过的话，被人打个问号或者一句"并非"顶回来时，
-    常会搬出记忆坚持原说法、反呛对方，一来一回就吵起来；这种时候由调用方给本轮附一句
-    PUSHBACK_NOTE。按类名认消息段，不依赖平台的组件类。
-
-    Args:
-        segments: 本条消息的消息段（event.get_messages()）。
-        self_id: 机器人自己的 ID；为空时无法判断引用的是谁，直接返回 False。
-
-    Returns:
-        引用了机器人自己的消息，且除 @ 以外的文字只有问号或一句短否认时为 True。
-    """
-    if not self_id:
-        return False
-    quoted_self = False
-    text = ""
-    for seg in segments or []:
-        kind = type(seg).__name__
-        if kind == "Reply":
-            quoted_self = (
-                quoted_self or str(getattr(seg, "sender_id", "") or "") == self_id
-            )
-        elif kind == "Plain":
-            text += str(getattr(seg, "text", "") or "")
-    return quoted_self and bool(PUSHBACK_TEXT.fullmatch(text.strip()))
